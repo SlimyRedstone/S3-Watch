@@ -70,10 +70,57 @@ dev/             scaffolding and EEZ Studio helper scripts
 
 ### Developer tools
 
-- `dev/new_app.py` scaffolds a new Brookesia app ready to host an EEZ Studio UI.
-- `dev/prefix_eez.py` and the per-app `update_eez.py` prefix EEZ Studio global
-  symbols so several apps can each ship their own `ui.c` without link
-  collisions. Both run automatically at CMake configure time.
+#### Creating a new app
+
+`dev/new_app.py` scaffolds a complete Brookesia app, ready to host an EEZ
+Studio LVGL UI. Run it from the project root (or from `dev/`):
+
+```sh
+python dev/new_app.py
+```
+
+It prompts for an app name in PascalCase (letters, digits and underscores,
+starting with a letter) and then creates `components/<Name>/` containing:
+
+- `<Name>.hpp` and `<Name>.cpp`, a working app subclassing
+  `systems::phone::App`, already registered with the launcher plugin macro
+- `CMakeLists.txt` that globs every source under the component and runs the
+  symbol prefixer at configure time
+- `idf_component.yml` depending on `brookesia_core` and the Waveshare BSP
+- `ui/` with stub `ui.h` and `ui.c`, so the app builds and shows a
+  placeholder screen before any UI exists
+- `update_eez.py`, this app's own symbol-prefix script
+- `<Name>.eez-project` and `<Name>.eez-project-ui-state`, copied from the
+  templates in `dev/`
+
+It also patches the `REQUIRES` list in `main/CMakeLists.txt` so the new
+component is linked in. The script aborts if `components/<Name>` already
+exists, so it never overwrites an app.
+
+After scaffolding:
+
+1. Open `components/<Name>/<Name>.eez-project` in EEZ Studio and design the UI.
+2. Export it for the LVGL target.
+3. Copy the generated files (`ui.*`, `screens.*`, `actions.*`, `images.*`,
+   `vars.*`, `styles.*`, `fonts.*`) into `components/<Name>/ui/`, overwriting
+   the stubs.
+4. Implement any user actions EEZ declared in `actions.h`.
+5. Rebuild:
+
+```sh
+idf.py fullclean && idf.py build
+```
+
+The app then appears in the launcher on its own, with no registration code
+to write by hand.
+
+#### EEZ symbol prefixing
+
+`dev/prefix_eez.py` and the per-app `update_eez.py` prepend `<Name>_` to
+every EEZ Studio global symbol, so several apps can each ship their own
+`ui.c`, `screens.c` and `actions.c` without multiple-definition link errors.
+Both are idempotent and run automatically at CMake configure time, so you
+only need to call them by hand when debugging a rename.
 
 ## Datasheets
 
