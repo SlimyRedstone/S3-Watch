@@ -1,0 +1,7 @@
+#ifndef EEZ_LVGL_UI_STRUCTS_H
+#define EEZ_LVGL_UI_STRUCTS_H
+
+
+
+
+#endif /*EEZ_LVGL_UI_STRUCTS_H*/
