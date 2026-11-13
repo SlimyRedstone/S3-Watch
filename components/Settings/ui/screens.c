@@ -171,6 +171,7 @@ void Settings_create_screen_main() {
                 SET_SUBMENU_SEPARATOR( sub_audio_page )
                 section = lv_menu_section_create( sub_audio_page );
                 create_switch(section, LV_SYMBOL_BELL, "Vibrations", get_vibrations_value());
+                create_slider(section, LV_SYMBOL_AUDIO, "Volume", 0, 100, 30);
             }
 
 
@@ -188,6 +189,7 @@ void Settings_create_screen_main() {
                 SET_SUBMENU_SEPARATOR( sub_bluetooth_page )
                 section = lv_menu_section_create( sub_bluetooth_page );
                 create_switch(section, LV_SYMBOL_BLUETOOTH, "Enable Bluetooth", get_bluetooth_value());
+                
             }
 
             //  ESP-Now Sub-Menu

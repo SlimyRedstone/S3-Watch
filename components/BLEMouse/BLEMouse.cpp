@@ -284,21 +284,55 @@ extern "C" void ble_mouse_send_consumer(uint16_t code)
 
 static i2c_master_dev_handle_t s_tp_dev = nullptr;
 
-static int read_finger_count(void)
+// Read the FocalTech touch controller directly: TD_STATUS (0x02, low nibble =
+// number of fingers) followed by the first two touch records (6 bytes each,
+// 0x03..0x0E). LVGL only ever sees the first point and the controller is free
+// to swap which finger comes first, so for scrolling we use the mean Y of all
+// fingers instead of LVGL's point: that is stable across a swap.
+//
+// Returns the finger count (0 on error) and, when count > 0, their mean Y.
+// Shares the BSP I2C bus with the esp_lcd_touch driver. Both run on the LVGL
+// task, so the two readers never interleave.
+static int read_touch(int *mean_y)
 {
     if (s_tp_dev == nullptr) {
         i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
         if (!bus) return 0;
         i2c_device_config_t cfg = {};
         cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-        cfg.device_address  = 0x38;   // FT5x06
+        cfg.device_address  = 0x38;   // FT5x06 family (FT3168 on this board)
         cfg.scl_speed_hz    = 400000;
-        if (i2c_master_bus_add_device(bus, &cfg, &s_tp_dev) != ESP_OK) return 0;
+        esp_err_t err = i2c_master_bus_add_device(bus, &cfg, &s_tp_dev);
+        if (err != ESP_OK) {
+            static bool warned = false;
+            if (!warned) { warned = true; ESP_UTILS_LOGW("touch dev add failed: %s", esp_err_to_name(err)); }
+            s_tp_dev = nullptr;
+            return 0;
+        }
     }
-    uint8_t reg = 0x02;   // TD_STATUS register
-    uint8_t v = 0;
-    if (i2c_master_transmit_receive(s_tp_dev, &reg, 1, &v, 1, 50) != ESP_OK) return 0;
-    return v & 0x0F;
+    uint8_t reg = 0x02;                 // TD_STATUS, then P1 (0x03..0x08), P2 (0x09..0x0E)
+    uint8_t buf[1 + 2 * 6] = {0};
+    esp_err_t err = i2c_master_transmit_receive(s_tp_dev, &reg, 1, buf, sizeof(buf), 50);
+    if (err != ESP_OK) {
+        ESP_UTILS_LOGD("touch read failed: %s", esp_err_to_name(err));
+        return 0;
+    }
+    int n = buf[0] & 0x0F;
+    if (n <= 0 || n > 5) return 0;
+    int use = (n > 2) ? 2 : n;
+    int sum_y = 0;
+    for (int i = 0; i < use; i++) {
+        const uint8_t *p = &buf[1 + i * 6];
+        // Same decode as esp_lcd_touch_ft5x06: Y = (P_YH & 0x0F) << 8 | P_YL
+        sum_y += (((int)p[2] & 0x0F) << 8) | p[3];
+    }
+    if (mean_y) *mean_y = sum_y / use;
+    return n;
+}
+
+static int read_finger_count(void)
+{
+    return read_touch(nullptr);
 }
 
 namespace esp_brookesia::apps {
@@ -357,6 +391,24 @@ bool BLEMouse::run()
     lv_obj_add_event_cb(_pad, &BLEMouse::onPadPressing, LV_EVENT_PRESSING, this);
     lv_obj_add_event_cb(_pad, &BLEMouse::onPadRelease,  LV_EVENT_RELEASED, this);
 
+    // Scroll strip hint along the right edge. Not clickable, so presses on it
+    // are delivered to _pad and classified in onPadPress().
+    _strip = lv_obj_create(_pad);
+    lv_obj_set_size(_strip, SCROLL_STRIP_PX, lv_pct(100));
+    lv_obj_align(_strip, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(_strip, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_opa(_strip, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(_strip, 0, 0);
+    lv_obj_set_style_radius(_strip, 0, 0);
+    lv_obj_set_style_pad_all(_strip, 0, 0);
+    lv_obj_clear_flag(_strip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(_strip, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *strip_lbl = lv_label_create(_strip);
+    lv_label_set_text(strip_lbl, LV_SYMBOL_UP "\n\n" LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_color(strip_lbl, lv_color_hex(0x3A3A3A), 0);
+    lv_obj_set_style_text_align(strip_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(strip_lbl);
+
     // _lbl_status = lv_label_create(scr);
     // lv_obj_set_style_text_color(_lbl_status, lv_color_white(), 0);
     // lv_obj_set_style_text_font(_lbl_status, &lv_font_montserrat_18, 0);
@@ -366,6 +418,7 @@ bool BLEMouse::run()
     refreshStatusIcon();
 
     _poll = lv_timer_create(&BLEMouse::onPollTimer, 30, this);
+    Settings::sleep_locked = true;     // hold wake-lock while mouse is used
     return true;
 }
 
@@ -381,6 +434,7 @@ bool BLEMouse::resume() { refreshStatusIcon(); return true; }
 bool BLEMouse::close()
 {
     _pad = nullptr;
+    _strip = nullptr;
     _lbl_status = nullptr;
     _poll = nullptr;
     _has_last = false;
@@ -410,13 +464,21 @@ void BLEMouse::onPadPress(lv_event_t *e)
     self->_last_point   = p;
     self->_start_point  = p;
     self->_has_last     = true;
-    self->_press_us     = esp_timer_get_time();
-    self->_move_total   = 0;
-    self->_two_finger   = (read_finger_count() >= 2);
-    self->_scroll_accum = 0;
+    self->_press_us      = esp_timer_get_time();
+    self->_move_total    = 0;
+    self->_scroll_accum  = 0;
+    self->_scroll_last_y = -1;
+    {
+        int my = 0;
+        self->_two_finger = (read_touch(&my) >= 2);
+        if (self->_two_finger) self->_scroll_last_y = my;
+    }
     // Mark as candidate "back" gesture if press starts within 30 px of left/right edge.
     int w = lv_obj_get_width(self->_pad);
     self->_edge_swipe  = (p.x < 30) || (p.x > w - 30);
+    // Press in the right-edge strip = one-finger scroll gesture.
+    self->_strip_scroll = (p.x >= w - SCROLL_STRIP_PX);
+    self->_strip_last_y = p.y;
 }
 
 void BLEMouse::onPadPressing(lv_event_t *e)
@@ -430,22 +492,49 @@ void BLEMouse::onPadPressing(lv_event_t *e)
     int raw_dx = p.x - self->_last_point.x;
     int raw_dy = p.y - self->_last_point.y;
 
+    // Finger count + mean Y straight from the controller (see read_touch()).
+    int mean_y = 0;
+    int fingers = read_touch(&mean_y);
+
+    // Diagnostic: log every change of the reported finger count. If this never
+    // prints "fingers=2" with two fingers on the glass, the FT3168 firmware is
+    // in its 1-point + gesture mode and two-finger scroll cannot work; use the
+    // right-edge strip instead.
+    {
+        static int s_last_fingers = -1;
+        if (fingers != s_last_fingers) {
+            s_last_fingers = fingers;
+            ESP_UTILS_LOGI("touch: fingers=%d", fingers);
+        }
+    }
+
     // Latch scroll mode as soon as a second finger shows up.
-    if (!self->_two_finger && read_finger_count() >= 2) {
-        self->_two_finger   = true;
-        self->_scroll_accum = 0;
-        self->_last_point   = p;     // do not turn the finger-landing jump into scroll
+    if (!self->_two_finger && fingers >= 2) {
+        self->_two_finger    = true;
+        self->_scroll_accum  = 0;
+        self->_scroll_last_y = mean_y;   // start measuring from here, not from the landing jump
+        self->_last_point    = p;
+        ESP_UTILS_LOGD("scroll: start (fingers=%d, y=%d)", fingers, mean_y);
         return;
     }
 
     if (self->_two_finger) {
-        // Finger swap / lift produces a large discontinuity: resync, no scroll.
-        if (raw_dy > SCROLL_JUMP_PX || raw_dy < -SCROLL_JUMP_PX ||
-            raw_dx > SCROLL_JUMP_PX || raw_dx < -SCROLL_JUMP_PX) {
-            self->_last_point = p;
+        self->_last_point = p;           // keep the cursor path in sync for the release handler
+        if (fingers < 2) {
+            // One finger lifted early: stay in scroll mode but stop measuring
+            // until both are back, so the remaining finger does not scroll.
+            self->_scroll_last_y = -1;
             return;
         }
-        self->_scroll_accum += raw_dy;
+        if (self->_scroll_last_y < 0) {  // first sample after a resync
+            self->_scroll_last_y = mean_y;
+            return;
+        }
+        int dy = mean_y - self->_scroll_last_y;
+        self->_scroll_last_y = mean_y;
+        if (dy > SCROLL_JUMP_PX || dy < -SCROLL_JUMP_PX) return;   // glitch, ignore
+
+        self->_scroll_accum += dy;
         int notches = self->_scroll_accum / SCROLL_STEP_PX;   // truncates toward zero
         if (notches != 0) {
             self->_scroll_accum -= notches * SCROLL_STEP_PX;
@@ -453,9 +542,26 @@ void BLEMouse::onPadPressing(lv_event_t *e)
             int wheel = -notches;
             if (wheel > 127)  wheel = 127;
             if (wheel < -127) wheel = -127;
+            ESP_UTILS_LOGD("scroll: dy=%d wheel=%d", dy, wheel);
             send_mouse_report(0, 0, 0, (int8_t)wheel);
         }
-        self->_last_point = p;
+        return;
+    }
+
+    // Right-edge strip: one-finger vertical drag = wheel.
+    if (self->_strip_scroll) {
+        int dy = p.y - self->_strip_last_y;
+        self->_strip_last_y = p.y;
+        self->_last_point   = p;
+        self->_scroll_accum += dy;
+        int notches = self->_scroll_accum / SCROLL_STEP_PX;
+        if (notches != 0) {
+            self->_scroll_accum -= notches * SCROLL_STEP_PX;
+            int wheel = -notches;            // slide down = scroll down
+            if (wheel > 127)  wheel = 127;
+            if (wheel < -127) wheel = -127;
+            send_mouse_report(0, 0, 0, (int8_t)wheel);
+        }
         return;
     }
 
@@ -479,7 +585,8 @@ void BLEMouse::onPadRelease(lv_event_t *e)
     self->_has_last = false;
 
     const int64_t held_us = esp_timer_get_time() - self->_press_us;
-    const bool tap = !self->_two_finger &&
+    const bool strip_drag = self->_strip_scroll && self->_scroll_accum != 0;
+    const bool tap = !self->_two_finger && !strip_drag &&
                      held_us < TAP_MAX_US &&
                      self->_move_total < TAP_MAX_MOVE_PX;
 
@@ -502,8 +609,9 @@ void BLEMouse::onPadRelease(lv_event_t *e)
             }
         }
     }
-    self->_edge_swipe = false;
-    self->_two_finger = false;
+    self->_edge_swipe   = false;
+    self->_two_finger   = false;
+    self->_strip_scroll = false;
 }
 
 void BLEMouse::onPollTimer(lv_timer_t *t)
