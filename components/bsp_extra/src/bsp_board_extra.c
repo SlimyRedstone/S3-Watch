@@ -13,7 +13,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
-#include "driver/i2c.h"
+// driver/i2c.h (legacy I2C driver) removed: never used here, and it is
+// end-of-life in ESP-IDF 6.0 (removed in 7.0). The BSP uses i2c_master.
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"

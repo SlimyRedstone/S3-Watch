@@ -1,4 +1,5 @@
 #include "BLEMouse.hpp"
+#include "Settings.hpp"   // status-bar Bluetooth icon
 #include <cstring>
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -320,7 +321,7 @@ BLEMouse::~BLEMouse() { _instance = nullptr; }
 
 bool BLEMouse::init()
 {
-    if (!s_nimble_up && gpio_get_level(BTN_GPIO) == 0) {
+    if (!s_nimble_up/*  && gpio_get_level(BTN_GPIO) == 0 */) {
         ble_mouse_init("S3 Watch");
         s_nimble_up = true;
     }
@@ -341,13 +342,13 @@ bool BLEMouse::run()
     gpio_config(&cfg);
     _btn_last = _btn_prev = gpio_get_level(BTN_GPIO);
     lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0A0A), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x030303), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     _pad = lv_obj_create(scr);
     lv_obj_set_size(_pad, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(_pad, lv_color_hex(0x080808), 0);
+    lv_obj_set_style_bg_color(_pad, lv_color_hex(0x030303), 0);
     lv_obj_set_style_border_width(_pad, 0, 0);
     lv_obj_set_style_radius(_pad, 0, 0);
     lv_obj_clear_flag(_pad, LV_OBJ_FLAG_SCROLLABLE);
@@ -356,11 +357,11 @@ bool BLEMouse::run()
     lv_obj_add_event_cb(_pad, &BLEMouse::onPadPressing, LV_EVENT_PRESSING, this);
     lv_obj_add_event_cb(_pad, &BLEMouse::onPadRelease,  LV_EVENT_RELEASED, this);
 
-    _lbl_status = lv_label_create(scr);
-    lv_obj_set_style_text_color(_lbl_status, lv_color_white(), 0);
-    lv_obj_set_style_text_font(_lbl_status, &lv_font_montserrat_18, 0);
-    lv_obj_align(_lbl_status, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_label_set_text(_lbl_status, s_connected ? "Connected" : "Advertising...");
+    // _lbl_status = lv_label_create(scr);
+    // lv_obj_set_style_text_color(_lbl_status, lv_color_white(), 0);
+    // lv_obj_set_style_text_font(_lbl_status, &lv_font_montserrat_18, 0);
+    // lv_obj_align(_lbl_status, LV_ALIGN_BOTTOM_MID, 0, 0);
+    // lv_label_set_text(_lbl_status, s_connected ? "Connected" : "Advertising...");
 
     refreshStatusIcon();
 
@@ -386,15 +387,33 @@ bool BLEMouse::close()
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Pad gestures
+//   1 finger drag        -> cursor move
+//   quick tap (1 finger) -> left click      (< TAP_MAX_US, < TAP_MAX_MOVE_PX)
+//   2 finger drag        -> wheel scroll    (slide down = scroll down)
+//   edge drag            -> back to launcher (unchanged)
+//
+// LVGL only ever reports one pointer (the touch driver's first point), so the
+// second finger is detected by reading the FT5x06 touch-count register
+// directly (read_finger_count()). Once a second finger has been seen the
+// whole press is treated as a scroll gesture, even if one finger lifts
+// early: that avoids a cursor jump when the reported point swaps fingers.
+// ---------------------------------------------------------------------------
+
 void BLEMouse::onPadPress(lv_event_t *e)
 {
     auto *self = static_cast<BLEMouse *>(lv_event_get_user_data(e));
     lv_indev_t *ind = lv_indev_active();
     if (!ind) return;
     lv_point_t p; lv_indev_get_point(ind, &p);
-    self->_last_point  = p;
-    self->_start_point = p;
-    self->_has_last    = true;
+    self->_last_point   = p;
+    self->_start_point  = p;
+    self->_has_last     = true;
+    self->_press_us     = esp_timer_get_time();
+    self->_move_total   = 0;
+    self->_two_finger   = (read_finger_count() >= 2);
+    self->_scroll_accum = 0;
     // Mark as candidate "back" gesture if press starts within 30 px of left/right edge.
     int w = lv_obj_get_width(self->_pad);
     self->_edge_swipe  = (p.x < 30) || (p.x > w - 30);
@@ -407,24 +426,48 @@ void BLEMouse::onPadPressing(lv_event_t *e)
     lv_indev_t *ind = lv_indev_active();
     if (!ind) return;
     lv_point_t p; lv_indev_get_point(ind, &p);
-    int dx = (int)((p.x - self->_last_point.x) * MOVE_GAIN);
-    int dy = (int)((p.y - self->_last_point.y) * MOVE_GAIN);
+
+    int raw_dx = p.x - self->_last_point.x;
+    int raw_dy = p.y - self->_last_point.y;
+
+    // Latch scroll mode as soon as a second finger shows up.
+    if (!self->_two_finger && read_finger_count() >= 2) {
+        self->_two_finger   = true;
+        self->_scroll_accum = 0;
+        self->_last_point   = p;     // do not turn the finger-landing jump into scroll
+        return;
+    }
+
+    if (self->_two_finger) {
+        // Finger swap / lift produces a large discontinuity: resync, no scroll.
+        if (raw_dy > SCROLL_JUMP_PX || raw_dy < -SCROLL_JUMP_PX ||
+            raw_dx > SCROLL_JUMP_PX || raw_dx < -SCROLL_JUMP_PX) {
+            self->_last_point = p;
+            return;
+        }
+        self->_scroll_accum += raw_dy;
+        int notches = self->_scroll_accum / SCROLL_STEP_PX;   // truncates toward zero
+        if (notches != 0) {
+            self->_scroll_accum -= notches * SCROLL_STEP_PX;
+            // HID wheel: +1 = scroll up. Sliding the fingers down scrolls down.
+            int wheel = -notches;
+            if (wheel > 127)  wheel = 127;
+            if (wheel < -127) wheel = -127;
+            send_mouse_report(0, 0, 0, (int8_t)wheel);
+        }
+        self->_last_point = p;
+        return;
+    }
+
+    // Single finger: cursor move.
+    int dx = (int)(raw_dx * MOVE_GAIN);
+    int dy = (int)(raw_dy * MOVE_GAIN);
     if (dx > 127) dx = 127;
     if (dx < -127) dx = -127;
     if (dy > 127) dy = 127;
     if (dy < -127) dy = -127;
-
-    int fingers = read_finger_count();
-    if (fingers >= 2) {
-        // Two-finger drag = wheel scroll. Up swipe = wheel +, down = wheel -.
-        int wheel = -(int)(dy / 8);
-        if (wheel > 127) wheel = 127; 
-        if (wheel < -127) wheel = -127;
-        if (wheel != 0) {
-            send_mouse_report(0, 0, 0, (int8_t)wheel);
-            self->_last_point = p;
-        }
-    } else if (dx != 0 || dy != 0) {
+    if (dx != 0 || dy != 0) {
+        self->_move_total += (raw_dx < 0 ? -raw_dx : raw_dx) + (raw_dy < 0 ? -raw_dy : raw_dy);
         send_mouse_report(0, (int8_t)dx, (int8_t)dy);
         self->_last_point = p;
     }
@@ -435,9 +478,21 @@ void BLEMouse::onPadRelease(lv_event_t *e)
     auto *self = static_cast<BLEMouse *>(lv_event_get_user_data(e));
     self->_has_last = false;
 
+    const int64_t held_us = esp_timer_get_time() - self->_press_us;
+    const bool tap = !self->_two_finger &&
+                     held_us < TAP_MAX_US &&
+                     self->_move_total < TAP_MAX_MOVE_PX;
+
+    // Quick, still, single-finger tap = left click (press + release).
+    if (tap) {
+        send_mouse_report(0x01, 0, 0);
+        send_mouse_report(0x00, 0, 0);
+    }
+
     // Per-app "back" gesture: edge-start drag, only when BLE is connected.
     // Lower threshold than the global gesture (15 px instead of 30).
-    if (self->_edge_swipe && s_connected) {
+    // A tap cannot also be a back swipe: it moved less than TAP_MAX_MOVE_PX.
+    if (!tap && !self->_two_finger && self->_edge_swipe && s_connected) {
         lv_indev_t *ind = lv_indev_active();
         if (ind) {
             lv_point_t p; lv_indev_get_point(ind, &p);
@@ -448,6 +503,7 @@ void BLEMouse::onPadRelease(lv_event_t *e)
         }
     }
     self->_edge_swipe = false;
+    self->_two_finger = false;
 }
 
 void BLEMouse::onPollTimer(lv_timer_t *t)
@@ -495,11 +551,25 @@ void BLEMouse::refreshStatusIcon()
 
 void BLEMouse::onConnectionChanged(bool /*connected*/)
 {
-    if (_instance == nullptr) return;
-    if (_instance->_lbl_status) {
-        lv_label_set_text(_instance->_lbl_status, s_connected ? "Connected" : "Advertising...");
+    // Reached from gap_event(), i.e. the NimBLE host task, not the LVGL task.
+    // LVGL is not thread safe: take the port lock. The LVGL task holds the
+    // same recursive mutex around lv_timer_handler(), so this serialises the
+    // label/status-bar update against rendering and the panel flush.
+    if (!bsp_display_lock(1000)) {
+        ESP_UTILS_LOGW("BLE state change: LVGL lock timeout, UI not updated");
+        return;
     }
-    _instance->refreshStatusIcon();
+    // Status-bar Bluetooth icon (Settings owns it). Independent of whether
+    // the BLE Mouse screen is open.
+    Settings::setBluetoothConnected(s_connected);
+
+    if (_instance != nullptr) {
+        if (_instance->_lbl_status) {
+            lv_label_set_text(_instance->_lbl_status, s_connected ? "Connected" : "Advertising...");
+        }
+        _instance->refreshStatusIcon();
+    }
+    bsp_display_unlock();
 }
 
 ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, BLEMouse, APP_NAME, []()

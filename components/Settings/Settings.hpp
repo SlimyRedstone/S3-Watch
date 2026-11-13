@@ -32,6 +32,7 @@ public:
         bool enable_wifi = false;
         bool enable_bluetooth = false;
         bool enable_espnow = false;
+        bool enable_upgrade = false;            // "Check for updates" switch (UI only, not persisted yet)
     };
     static AppConfig cfg;                              // live values
     static constexpr const char *CFG_PATH = "/sdcard/.settings.json";
@@ -42,6 +43,12 @@ public:
     // entering light/deep sleep while it is in use (e.g. flashlight).
     // Polled by ClockApp's sleep monitor.
     static volatile bool sleep_locked;
+
+    // Bluetooth status-bar icon (shown next to the SD-card icon while a BLE
+    // central is connected). Called by BLEMouse from its connection callback.
+    // Caller must hold the LVGL lock. Safe to call before the status bar
+    // exists: the state is remembered and applied by the status timer.
+    static void setBluetoothConnected(bool connected);
 
     static Settings *requestInstance(
         bool use_status_bar = true, bool use_navigation_bar = false);
@@ -61,6 +68,11 @@ private:
     void refreshUi();
 
     static Settings *_instance;
+
+    // Bluetooth icon state (see setBluetoothConnected()).
+    static bool _bt_connected;
+    static bool _bt_icon_shown;
+    static void syncBluetoothIcon();
 
     // UI labels
     lv_obj_t   *_lbl_title  = nullptr;

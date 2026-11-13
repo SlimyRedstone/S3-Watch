@@ -939,7 +939,8 @@ namespace esp_brookesia::apps {
 
 		s_imu_stop = false;
 		if (s_imu_task == nullptr) {
-			xTaskCreate(imu_task, "imu_pod", 6 * 1024, NULL, 3, &s_imu_task);
+			// Core 0 = radio/sensor core, keeps the 50 Hz I2C polling off the LVGL core.
+			xTaskCreatePinnedToCore(imu_task, "imu_pod", 6 * 1024, NULL, 3, &s_imu_task, 0);
 		}
 
 		s_bg_task = nullptr;
@@ -958,7 +959,7 @@ namespace esp_brookesia::apps {
 		if (s_bg_task != nullptr || s_bg_ready) return;
 		// Priority 1 == the main task's. Deliberately not higher: at priority 2
 		// it preempted app_main and raced ahead of the display bring-up.
-		xTaskCreate(backgroundInit, "pod_bg", 4 * 1024, nullptr, 1, &s_bg_task);
+		xTaskCreatePinnedToCore(backgroundInit, "pod_bg", 4 * 1024, nullptr, 1, &s_bg_task, 0);
 	}
 
 	void Podometer::releaseSleepPins() {

@@ -13,6 +13,12 @@ public:
     static constexpr int64_t    LONG_PRESS_US     = 500 * 1000;
     static constexpr float      MOVE_GAIN         = 1.5f;
 
+    // Touch gestures on the pad.
+    static constexpr int64_t    TAP_MAX_US        = 250 * 1000; // press shorter than this ...
+    static constexpr int        TAP_MAX_MOVE_PX   = 12;         // ... and moving less than this = left click
+    static constexpr int        SCROLL_STEP_PX    = 10;         // two-finger travel per wheel notch
+    static constexpr int        SCROLL_JUMP_PX    = 360;         // larger jump = finger swap, ignore
+
     static BLEMouse *requestInstance(
         bool use_status_bar = true, bool use_navigation_bar = false);
     ~BLEMouse();
@@ -47,6 +53,12 @@ private:
     lv_point_t _start_point  = {};
     bool       _has_last     = false;
     bool       _edge_swipe   = false;   // candidate for back-to-launcher gesture
+
+    // Gesture classification for the current press.
+    int64_t    _press_us     = 0;       // esp_timer time at LV_EVENT_PRESSED
+    int        _move_total   = 0;       // |dx|+|dy| accumulated since press (tap rejection)
+    bool       _two_finger   = false;   // latched once a 2nd finger is seen: scroll mode
+    int        _scroll_accum = 0;       // raw px since the last wheel notch
 
     int        _btn_last     = 1;
     int        _btn_stable   = 0;

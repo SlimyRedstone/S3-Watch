@@ -16,16 +16,45 @@
 #define ESP_UTILS_LOG_TAG "Main"
 #include "./dark/stylesheet.hpp"
 #include "esp_lib_utils.h"
+#include "esp_heap_caps.h"
 #include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <functional>
 
 using namespace esp_brookesia;
 using namespace esp_brookesia::gui;
 using namespace esp_brookesia::systems::phone;
 
 constexpr bool EXAMPLE_SHOW_MEM_INFO = true;
+
+// Run `fn` synchronously on a task pinned to `core` and wait for it.
+//
+// Peripheral drivers allocate their interrupt on the core that calls the
+// init (spi_bus / i2c_new_master_bus with the default AUTO affinity). app_main
+// runs on core 0, so without this the LCD DMA-done and I2C interrupts would
+// fire on the radio core and wake the LVGL task on the other one. Core 0 keeps
+// BT controller, NimBLE host, Wi-Fi/ESP-NOW and lwIP; core 1 keeps LVGL,
+// display and touch.
+static void run_on_core(BaseType_t core, std::function<void()> fn)
+{
+	struct Job { std::function<void()> fn; SemaphoreHandle_t done; };
+	Job job{ std::move(fn), xSemaphoreCreateBinary() };
+	ESP_UTILS_CHECK_NULL_EXIT(job.done, "Create semaphore failed");
+	BaseType_t ok = xTaskCreatePinnedToCore(
+		[](void *p) {
+			auto *j = static_cast<Job *>(p);
+			j->fn();
+			xSemaphoreGive(j->done);
+			vTaskDelete(nullptr);
+		},
+		"core_init", 8 * 1024, &job, 5, nullptr, core);
+	ESP_UTILS_CHECK_FALSE_EXIT(ok == pdPASS, "Create core init task failed");
+	xSemaphoreTake(job.done, portMAX_DELAY);
+	vSemaphoreDelete(job.done);
+}
 
 extern "C" void app_main(void) {
 	
@@ -37,7 +66,8 @@ extern "C" void app_main(void) {
 
 	esp_brookesia::apps::Podometer::releaseSleepPins();
 
-	bsp_i2c_init();
+	// I2C bus (touch, PMU, IMU, RTC): interrupt on the UI core.
+	run_on_core(1, []() { bsp_i2c_init(); });
 	esp_brookesia::apps::Podometer::handleUlpWakeAndSleep();
 	{
 		esp_pm_config_t pm_cfg = {
@@ -64,7 +94,44 @@ extern "C" void app_main(void) {
 			.timer_period_ms	= 1,         
 		}
 	};
-	ESP_UTILS_CHECK_NULL_EXIT( bsp_display_start_with_config(&cfg), "Start display failed");
+	// Display + touch brought up from core 1 so the LCD SPI (QSPI DMA-done) and
+	// touch interrupts are allocated there, next to the LVGL task.
+	lv_display_t *disp = nullptr;
+	run_on_core(1, [&]() { disp = bsp_display_start_with_config(&cfg); });
+	ESP_UTILS_CHECK_NULL_EXIT(disp, "Start display failed");
+
+	// Move LVGL onto internal, DMA-capable draw buffers.
+	//
+	// The BSP hard-codes one 410x50 px draw buffer allocated with plain malloc,
+	// which lands in PSRAM. The SPI master does not treat PSRAM as DMA-capable
+	// (esp_ptr_dma_capable() = internal SRAM only), so for EVERY flush it did
+	// heap_caps_aligned_alloc(<stripe bytes>, MALLOC_CAP_DMA) + memcpy, up to
+	// 41 kB of contiguous internal RAM per stripe, freed again in the DMA-done
+	// ISR. As soon as BLE (or anything else) fragments the internal heap that
+	// allocation fails with ESP_ERR_NO_MEM, esp_lcd logs
+	//   panel_io_spi_tx_color(395): spi transmit (queue) color failed
+	// once per stripe and the frame is torn.
+	//
+	// Two 410x20 px internal buffers (16.4 kB each, allocated once at boot) are
+	// handed to the DMA directly. Double buffering lets LVGL render stripe N+1
+	// while stripe N is on the wire. The BSP's PSRAM buffer is simply unused.
+	{
+		constexpr int    DRAW_LINES = 20;
+		const size_t     draw_bytes = (size_t)BSP_LCD_H_RES * DRAW_LINES * sizeof(uint16_t); // RGB565
+		const uint32_t   caps       = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+		void *draw1 = heap_caps_aligned_alloc(64, draw_bytes, caps);
+		void *draw2 = heap_caps_aligned_alloc(64, draw_bytes, caps);
+		if (draw1 != nullptr && draw2 != nullptr) {
+			bsp_display_lock(0);
+			lv_display_set_buffers(disp, draw1, draw2, draw_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+			bsp_display_unlock();
+			ESP_UTILS_LOGI("LVGL draw buffers: 2 x %u B internal DMA (%d lines)", (unsigned)draw_bytes, DRAW_LINES);
+		} else {
+			ESP_UTILS_LOGW("Internal DMA draw buffers unavailable, keeping BSP PSRAM buffer");
+			heap_caps_free(draw1);
+			heap_caps_free(draw2);
+		}
+	}
 	
 	ESP_LOGI("TIMING","t_display=%lld us", esp_timer_get_time());
 
@@ -170,6 +237,7 @@ extern "C" void app_main(void) {
 		esp_utils::thread_config_guard thread_config(
 				{
 						.name				= "mem_info",
+						.core_id		= 1,       // UI-side helper: it only touches LVGL
 						.stack_size = 4096,
 				});
 		boost::thread([=]() {
@@ -204,7 +272,12 @@ extern "C" void app_main(void) {
 							"Set memory label failed");
 				}
 
-				boost::this_thread::sleep_for(boost::chrono::seconds(5));
+				// Was boost::this_thread::sleep_for(5 s). Under IDF 5.5.2 that wait
+				// returned without blocking: task_wdt caught this thread spinning
+				// inside boost's wait loop (IDLE0 starved, LVGL lock hammered,
+				// touch lag). Block in the kernel instead; this is a pthread so
+				// vTaskDelay() is valid here.
+				vTaskDelay(pdMS_TO_TICKS(5000));
 			}
 		}).detach();
 	}

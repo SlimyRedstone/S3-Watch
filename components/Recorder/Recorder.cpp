@@ -213,7 +213,8 @@ namespace {
 		bsp_extra_codec_set_fs(SAMPLE_RATE, 16, I2S_SLOT_MODE_STEREO);
 
 		s_recording = true;
-		xTaskCreate(rec_task, "rec", 16 * 1024, NULL, 2, &s_rec_task);
+		// Core 0: audio capture + FFT stay off the LVGL core.
+		xTaskCreatePinnedToCore(rec_task, "rec", 16 * 1024, NULL, 2, &s_rec_task, 0);
 		return true;
 	}
 

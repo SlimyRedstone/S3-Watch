@@ -194,7 +194,8 @@ bool ClockApp::init()
     // app is foreground (including the launcher with no app open).
     _stop_sleep_task = false;
     if (_sleep_task == nullptr) {
-        xTaskCreate(&ClockApp::sleepMonitorTask, "ClockSleep", 4096, this, 5, &_sleep_task);
+        // Core 1 = UI core: this task mostly talks to LVGL (lock + inactivity time).
+        xTaskCreatePinnedToCore(&ClockApp::sleepMonitorTask, "ClockSleep", 4096, this, 5, &_sleep_task, 1);
     }
     return true;
 }

@@ -2,10 +2,18 @@
 # https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html
 # The following five lines of boilerplate have to be in your project's
 # CMakeLists in this exact order for cmake to work correctly
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.16)
 
 # Drop bundled demo apps from the build so they don't show up in the launcher.
 set(EXCLUDE_COMPONENTS brookesia_app_squareline_demo)
+
+# Windows: a process command line is capped at 32767 characters. The final
+# ELF stub (project_elf_src_esp32s3.c) is compiled with the public include
+# dirs of EVERY component (316 of them, ~32.7 kB under IDF 5.5.2) and ninja
+# fails with "CreateProcess: The parameter is incorrect". Make the Ninja
+# generator put compiler arguments into @response files for all targets.
+# Must be set before project.cmake creates any target. Harmless elsewhere.
+set(CMAKE_NINJA_FORCE_RESPONSE_FILE ON)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(esp-brookesia)

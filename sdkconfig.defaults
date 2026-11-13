@@ -50,3 +50,7 @@ CONFIG_LV_FONT_FMT_TXT_LARGE=y
 CONFIG_LV_USE_FONT_COMPRESSED=y
 CONFIG_LV_USE_SNAPSHOT=y
 CONFIG_LV_BUILD_EXAMPLES=n
+# Core split: radio (BT controller, NimBLE host, Wi-Fi, lwIP) on core 0,
+# LVGL + display/touch interrupts on core 1 (see main.cpp run_on_core).
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y

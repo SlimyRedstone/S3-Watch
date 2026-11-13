@@ -28,8 +28,11 @@ static XPowersPMU              s_pmu;
 static bool                    s_pmu_inited = false;
 static i2c_master_dev_handle_t s_pmu_dev    = nullptr;
 
+// The C bridge below lives outside the namespace; pull the class in.
+using esp_brookesia::apps::Settings;
 
 extern "C" {
+    #include "settings_ui_bridge.h"   // prototypes missing from generated actions.h
     #include "ui.h"
     #include "vars.h"
     #include "styles.h"
@@ -39,23 +42,24 @@ extern "C" {
     #include "screens.h"
     LV_IMG_DECLARE(settings_icon);
     LV_IMG_DECLARE(sd_card_icon);
+    LV_IMG_DECLARE(bluetooth_icon_2);   // 16x16, same size as the SD icon
+    // LV_IMG_DECLARE(bluetooth_icon);
+    LV_IMG_DECLARE(bluetooth_icon_2);
 
-
-    bool dim_screen, user_wake_up, sleep_charge, vibrations_enabled, 
-        wifi_enabled, bluetooth_enabled, upgrade_enabled, espnow_enabled = false;
-
+    // EEZ-generated screens.c calls these C getters/setters. They are plain
+    // views over the persistent Settings::cfg (declared inside
+    // namespace esp_brookesia::apps, hence the using-declaration above).
     char version_text[64] = {0};
 
     bool get_dim_screen_value(void) {
-        return dim_screen;
+        return Settings::cfg.dim_screen;
     }
     void set_dim_screen_value(bool value) {
-        dim_screen = value;
-        cfg.dim_screen = value;
+        Settings::cfg.dim_screen = value;
     }
 
     bool get_user_wake_up_button_value(void) {
-        return user_wake_up;
+        return Settings::cfg.enable_user_button_wake_up;
     }
     void set_user_wake_up_button_value(bool value) {
         if (value) {
@@ -63,73 +67,69 @@ extern "C" {
         } else {
             Settings::sleep_locked = false;
         }
-        user_wake_up = value;
-        cfg.user_wake_up = value;
+        Settings::cfg.enable_user_button_wake_up = value;
     }
 
     bool get_sleep_charge_button_value(void) {
-        return sleep_charge;
+        return Settings::cfg.disable_sleep_on_charge;
     }
     void set_sleep_charge_button_value(bool value) {
-        sleep_charge = value;
-        cfg.sleep_charge = value;
+        Settings::cfg.disable_sleep_on_charge = value;
     }
 
     bool get_vibrations_value(void) {
-        return vibrations_enabled;
+        return Settings::cfg.enable_vibrations;
     }
     void set_vibrations_value(bool value) {
-        vibrations_enabled = value;
-        cfg.vibrations_enabled = value;
+        Settings::cfg.enable_vibrations = value;
     }
 
     bool get_wifi_value(void) {
-        return wifi_enabled;
+        return Settings::cfg.enable_wifi;
     }
     void set_wifi_value(bool value) {
-        wifi_enabled = value;
-        cfg.wifi_enabled = value;
+        Settings::cfg.enable_wifi = value;
     }
 
     bool get_bluetooth_value(void) {
-        return bluetooth_enabled;
+        return Settings::cfg.enable_bluetooth;
     }
     void set_bluetooth_value(bool value) {
-        bluetooth_enabled = value;
-        cfg.bluetooth_enabled = value;
+        Settings::cfg.enable_bluetooth = value;
     }
 
     bool get_upgrade_value(void) {
-        return upgrade_enabled;
+        return Settings::cfg.enable_upgrade;
     }
     void set_upgrade_value(bool value) {
-        upgrade_enabled = value;
-        cfg.upgrade_enabled = value;
+        Settings::cfg.enable_upgrade = value;
     }
 
     bool get_espnow_value(void) {
-        return espnow_enabled;
+        return Settings::cfg.enable_espnow;
     }
     void set_espnow_value(bool value) {
-        espnow_enabled = value;
-        cfg.espnow_enabled = value;
+        Settings::cfg.enable_espnow = value;
     }
 
     const char *get_version_value(const char* prefix, const char *suffix) {
-        char txt[128] = {0};
+        // static: the generated UI keeps the returned pointer (label text),
+        // a stack buffer here was a dangling pointer (-Wreturn-local-addr).
+        static char txt[128] = {0};
         if (prefix == NULL) prefix = "";
         if (suffix == NULL) suffix = "";
 
         if (strlen(prefix) + strlen(suffix) > (sizeof(txt)/2)) return __TIME__;
         char version_txt[16] = {0};
-        
+
         snprintf(version_txt, sizeof(version_txt), "%s", __TIME__);
         snprintf(txt, sizeof(txt), "%s%s%s", prefix, version_txt, suffix);
         return txt;
     }
     void set_version_value(const char * value) {
-        // (void)value;
-        strncpy(version_text, value, sizeof(value));
+        // sizeof(value) was the pointer size (4), not the buffer size.
+        strncpy(version_text, value, sizeof(version_text) - 1);
+        version_text[sizeof(version_text) - 1] = 0;
     }
 
 
@@ -155,9 +155,11 @@ extern "C" {
     void action_slider_changed(lv_event_t *e) {
         lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
         int v   = (int)lv_slider_get_value(slider);
+        (void)v;   // TODO: wire slider value to a setting
     }
 }
 static constexpr int SD_ICON_ID = 1001;
+static constexpr int BT_ICON_ID = 1002;
 
 
 static int pmu_reg_read(uint8_t /*addr*/, uint8_t reg, uint8_t *data, uint8_t len)
@@ -213,6 +215,8 @@ static constexpr char APP_NAME[] = "Settings";
 Settings *Settings::_instance = nullptr;
 Settings::AppConfig Settings::cfg{};   // default-initialized
 volatile bool Settings::sleep_locked = false;
+bool Settings::_bt_connected  = false;
+bool Settings::_bt_icon_shown = false;
 static bool s_sd_mounted = false;
 
 // ---------------------------------------------------------------------------
@@ -241,47 +245,30 @@ bool Settings::loadFromSd()
             cfg.inactivity_delay_ms = (uint32_t)d->valueint;
         }
 
+        // Items returned by cJSON_GetObjectItem() are owned by `j`.
+        // Do NOT cJSON_Delete() them individually: cJSON_Delete() also walks
+        // ->next, so it freed every following sibling and cJSON_Delete(j)
+        // below then double-freed them (heap corruption on boot with SD).
+        cJSON *a0 = cJSON_GetObjectItem(root, "dim_screen");
+        cfg.dim_screen = cJSON_IsBool(a0) && cJSON_IsTrue(a0);
+
         cJSON *aa = cJSON_GetObjectItem(root, "enable_user_button_wake_up");
-        cfg.enable_user_button_wake_up = false;
-        if (cJSON_IsBool(aa)) {
-            if (cJSON_IsTrue(aa)) cfg.enable_user_button_wake_up = true;
-        }
-        cJSON_Delete(aa);
+        cfg.enable_user_button_wake_up = cJSON_IsBool(aa) && cJSON_IsTrue(aa);
 
         cJSON *ab = cJSON_GetObjectItem(root, "disable_sleep_on_charge");
-        cfg.disable_sleep_on_charge = false;
-        if (cJSON_IsBool(ab)) {
-            if (cJSON_IsTrue(ab)) cfg.disable_sleep_on_charge = true;
-        }
-        cJSON_Delete(ab);
+        cfg.disable_sleep_on_charge = cJSON_IsBool(ab) && cJSON_IsTrue(ab);
 
         cJSON *ac = cJSON_GetObjectItem(root, "enable_vibrations");
-        cfg.enable_vibrations = false;
-        if (cJSON_IsBool(ac)) {
-            if (cJSON_IsTrue(ac)) cfg.enable_vibrations = true;
-        }
-        cJSON_Delete(ac);
+        cfg.enable_vibrations = cJSON_IsBool(ac) && cJSON_IsTrue(ac);
 
         cJSON *ad = cJSON_GetObjectItem(root, "enable_wifi");
-        cfg.enable_wifi = false;
-        if (cJSON_IsBool(ad)) {
-            if (cJSON_IsTrue(ad)) cfg.enable_wifi = true;
-        }
-        cJSON_Delete(ad);
+        cfg.enable_wifi = cJSON_IsBool(ad) && cJSON_IsTrue(ad);
 
         cJSON *ae = cJSON_GetObjectItem(root, "enable_bluetooth");
-        cfg.enable_bluetooth = false;
-        if (cJSON_IsBool(ae)) {
-            if (cJSON_IsTrue(ae)) cfg.enable_bluetooth = true;
-        }
-        cJSON_Delete(ae);
+        cfg.enable_bluetooth = cJSON_IsBool(ae) && cJSON_IsTrue(ae);
 
         cJSON *af = cJSON_GetObjectItem(root, "enable_espnow");
-        cfg.enable_espnow = false;
-        if (cJSON_IsBool(af)) {
-            if (cJSON_IsTrue(af)) cfg.enable_espnow = true;
-        }
-        cJSON_Delete(af);
+        cfg.enable_espnow = cJSON_IsBool(af) && cJSON_IsTrue(af);
     }
     cJSON_Delete(j);
     ESP_UTILS_LOGI("Settings loaded: inactivity_delay=%u ms",
@@ -475,7 +462,12 @@ bool Settings::back()
 void Settings::onStatusTimer(lv_timer_t *t)
 {
     auto *self = static_cast<Settings *>(lv_timer_get_user_data(t));
-    if (self == nullptr || !s_pmu_inited) return;
+    if (self == nullptr) return;
+
+    // Catches a BLE state change that arrived before the status bar existed.
+    syncBluetoothIcon();
+
+    if (!s_pmu_inited) return;
 
     int  pct        = (int)s_pmu.getBatteryPercent();
     bool charging   = s_pmu.isCharging();
@@ -493,6 +485,43 @@ void Settings::onStatusTimer(lv_timer_t *t)
     if (show_pct < 0)   show_pct = 0;
     if (show_pct > 100) show_pct = 100;
     status_bar->setBatteryPercent(charging, show_pct);
+}
+
+// ---------------------------------------------------------------------------
+// Bluetooth status-bar icon
+// ---------------------------------------------------------------------------
+
+void Settings::setBluetoothConnected(bool connected)
+{
+    _bt_connected = connected;
+    syncBluetoothIcon();
+}
+
+// Adds / removes the icon so it matches _bt_connected. Idempotent. Needs the
+// LVGL lock: removeIcon() destroys the icon's LVGL objects.
+void Settings::syncBluetoothIcon()
+{
+    if (_bt_connected == _bt_icon_shown) return;
+    if (_instance == nullptr) return;
+
+    auto *phone = _instance->getSystem();
+    if (phone == nullptr) return;
+    auto *bar = phone->getDisplay().getStatusBar();
+    if (bar == nullptr) return;
+
+    if (_bt_connected) {
+        systems::phone::StatusBarIcon::Data icon = {};
+        icon.size  = gui::StyleSize::SQUARE(16);
+        icon.icon.image_num = 1;
+        icon.icon.images[0] = gui::StyleImage::IMAGE(&bluetooth_icon_2);
+        // Same area as the SD-card icon so the two sit side by side.
+        if (bar->addIcon(icon, /*area_index=*/2, BT_ICON_ID)) {
+            _bt_icon_shown = true;
+        }
+    } else {
+        bar->removeIcon(BT_ICON_ID);
+        _bt_icon_shown = false;
+    }
 }
 
 void Settings::onUiTimer(lv_timer_t *t)

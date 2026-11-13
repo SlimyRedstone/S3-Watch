@@ -9,7 +9,7 @@ endif()
 idf_component_register(
     SRCS ${PROJ_SRCS_C} ${PROJ_SRCS_CPP}
     INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}
-    REQUIRES driver bt nvs_flash
+    REQUIRES driver bt nvs_flash Settings
     WHOLE_ARCHIVE
 )
 

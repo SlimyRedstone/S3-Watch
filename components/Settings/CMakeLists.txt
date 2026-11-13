@@ -21,3 +21,12 @@ set_source_files_properties(
     PROPERTIES
         COMPILE_FLAGS "-Wno-missing-field-initializers"
 )
+
+# The EEZ export in ui/ calls get_sleep_charge_button_value() without a
+# prototype (missing from the generated actions.h). ui/ must not be edited,
+# so inject the declaration at compile time. See settings_ui_bridge.h.
+set_source_files_properties(
+    ${CMAKE_CURRENT_LIST_DIR}/ui/screens.c
+    PROPERTIES
+        COMPILE_FLAGS "-include ${CMAKE_CURRENT_LIST_DIR}/settings_ui_bridge.h"
+)

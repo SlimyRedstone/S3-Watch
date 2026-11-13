@@ -8,7 +8,7 @@ installed into a launcher.
 
 ## Requirements
 
-- ESP-IDF **v5.4.3** (exact version, other releases are untested)
+- ESP-IDF **v5.5.2** (exact version, other releases are untested; v5.4.3 was the previous baseline)
 - Waveshare ESP32-S3-Touch-AMOLED-2.06 board
 - A microSD card (required by the Recorder and by persisted settings)
 - Python 3 (used by the build to generate per-app UI symbols)
