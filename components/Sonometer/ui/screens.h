@@ -1,0 +1,58 @@
+#ifndef EEZ_LVGL_UI_SCREENS_H
+#define EEZ_LVGL_UI_SCREENS_H
+
+#include <lvgl.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Screens
+
+enum ScreensEnum {
+    _SCREEN_ID_FIRST = 1,
+    SCREEN_ID_MAIN = 1,
+    _SCREEN_ID_LAST = 1
+};
+
+typedef struct _objects_t {
+    lv_obj_t *main;
+    lv_obj_t *sound_label;
+    lv_obj_t *sound_graph;
+    lv_obj_t *main_container;
+    lv_obj_t *graph_container;
+    lv_obj_t *graph_scale;
+} objects_t;
+
+extern objects_t Sonometer_objects;
+
+
+typedef struct {
+    lv_scale_section_t *low;
+    lv_scale_section_t *mid;
+    lv_scale_section_t *high;
+    lv_scale_section_t *danger;
+} screen_main_state_t;
+
+extern screen_main_state_t Sonometer_screen_main_state;
+
+void Sonometer_create_screen_main();
+void Sonometer_tick_screen_main();
+
+void Sonometer_tick_screen_by_id(enum ScreensEnum screenId);
+void Sonometer_tick_screen(int screen_index);
+
+void Sonometer_create_screens();
+
+
+extern lv_style_t Sonometer_graph_scale_low_main_style;
+extern lv_style_t Sonometer_graph_scale_mid_main_style;
+extern lv_style_t Sonometer_graph_scale_high_main_style;
+extern lv_style_t Sonometer_graph_scale_danger_main_style;
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /*EEZ_LVGL_UI_SCREENS_H*/

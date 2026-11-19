@@ -186,6 +186,69 @@ Both files are git-ignored.
    sleep internals (new `CONFIG_PM_SLP_IRAM_OPT`, `CONFIG_ESP_SLEEP_*` workarounds). Watch the first sleep/wake
    cycle and the ULP batch wake on hardware.
 
+## Settings app: every Display / Audio / Bluetooth control now does something
+
+`components/Settings` (UI in `ui/` untouched; the generated code gives one shared callback per widget type and no user
+data, so widgets are identified by their row title, e.g. "Time before light sleep").
+
+- `Settings::AppConfig` restructured to mirror the JSON: `cfg.display.*`, `cfg.audio.*`, `cfg.bluetooth.enabled`,
+  `cfg.wifi.enabled`, `cfg.espnow.enabled`, `cfg.upgrade.enabled`. `inactivity_delay_ms` is gone. File layout:
+  `settings.display{brightness, dim_screen, user_button_wake_up, disable_sleep_on_charge, light_sleep_brightness,
+  light_sleep_delay_s, deep_sleep_delay_s}`, `settings.audio{vibrations, vibration_duration, volume}`,
+  `settings.bluetooth{enabled}`, plus `wifi`/`espnow`/`upgrade{enabled}`. Old flat files are ignored (defaults apply,
+  file rewritten on first save). Defaults = the generated sliders' initial values (85, 80, 15 s, 30 s, 30).
+- Slider values are overwritten from `cfg` right after `Settings_ui_init()` (`syncSlidersFromCfg()`); switches already
+  read the getters. Switch changes were never reaching the setters (generated code only hooks `action_button_pressed`),
+  now mapped by row title. Saves are debounced (1 s after the last change) so a slider drag is one SD write.
+- Brightness: live `bsp_display_brightness_set()` under the LVGL lock (`Settings::setPanelBrightness()`).
+  `ClockApp::setBacklight(true)` now restores `cfg.display.brightness` instead of the BSP's fixed 100 %.
+- Sleep ladder (`ClockApp::sleepMonitorTask`): idle >= `light_sleep_delay_s` -> `enterLightSleep()` (was: straight to
+  deep sleep). Light sleep dims the panel to `light_sleep_brightness` (1..255 slider -> %) when "Dim screen on light
+  sleep" is on, else panel off; wake on touch INT, plus GPIO0 only when "User button wake-up" is on; timer wake at
+  `deep_sleep_delay_s` -> `enterDeepSleep()`. "Disable sleep when charging" skips both while VBUS is present
+  (`Settings::isCharging()`, AXP2101). While the BLE stack is up, `esp_light_sleep_start()` is replaced by a polling
+  wait (`waitForInput()`): the controller does not survive forced light sleep with modem sleep off.
+- Deep sleep + "User button wake-up": ESP deep sleep with ext1 on GPIO0 (rails stay up) instead of the AXP2101 shutdown,
+  which only the power key can wake. Off: unchanged PMU shutdown. The Podometer's ULP handler (when it owns deep sleep)
+  always uses ext1 on GPIO0.
+- Vibrations: motor on GPIO18 (schematic "Motor" block; same pin as Waveshare's factory VibrationTest), active high,
+  `Settings::vibrate(ms)` with an esp_timer off-switch, capped at 1 s. A press hook on the pointer indev
+  (`lv_indev_add_event_cb(.., LV_EVENT_PRESSED)`) ticks on buttons, switches, sliders, checkboxes, dropdowns, rollers,
+  text areas, button matrices, arcs, spinboxes, keyboards, menu rows and clickable images/labels (launcher icons).
+  Plain containers do not vibrate (LVGL makes them clickable by default). `vibration_duration` defaults to 100 ms.
+- Volume: `Settings::setVolume()` -> `bsp_extra_codec_volume_set()` when the codec is up (`bsp_extra_codec_is_init()`,
+  new in `components/bsp_extra`). Recorder's lazy codec init now starts at `cfg.audio.volume` (was 60) and its own
+  slider writes through Settings. Recorder `REQUIRES Settings`.
+- Bluetooth: `BLEMouse::init()` no longer starts NimBLE unconditionally. It calls `Settings::ensureLoaded()` (app init
+  order is undefined), registers `ble_set_enabled()` via `Settings::setBluetoothHandler()`, and starts the stack only if
+  `cfg.bluetooth.enabled`. The switch starts/stops at runtime: stop = `nimble_port_stop()` + `nimble_port_deinit()`
+  (controller memory kept, so it restarts), with GAP callbacks muted during the stop so the host task cannot block on
+  the LVGL lock held by the switch handler. `Settings::bluetooth_running` tells ClockApp which light-sleep path to use.
+- Removed: the old `sleep_locked = isVbusIn()` at Settings init and in the wake-up switch setter (it blocked sleep on
+  USB regardless of any setting); the dead +/- delay UI code.
+- Settings `REQUIRES` gains `esp_timer bsp_extra`.
+
+### Runtime crash `assert failed: bt_osi_mem_malloc bt_osi_mem.c:40 (mem != NULL)` when switching Bluetooth on
+Internal SRAM was exhausted at runtime: LVGL used plain `malloc()`, and with `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=8192`
+every small allocation (objects, styles, draw tasks: the whole launcher and every app screen) landed in internal SRAM
+first. Boot had room for the controller; 18 s of UI later the NimBLE host could not get a sub-kilobyte block.
+- `main/lv_mem_core_psram.c` (new) + `CONFIG_LV_USE_CUSTOM_MALLOC=y`: LVGL allocator with a floor policy. Blocks of
+  4 KB and more (layer buffers, snapshots) go to PSRAM. Smaller ones stay in internal SRAM as long as internal free stays
+  above 112 KB after the allocation, else PSRAM. Rev 1 put everything in PSRAM: draw tasks are allocated per frame and
+  the object/style tree is read per redraw, so the frame rate halved and the partial-stripe flush showed as tearing.
+  With the floor the UI runs from SRAM as before, while the radio always finds its memory; once BLE is up (it lives
+  inside the floor) LVGL keeps spilling to PSRAM until it is stopped. The DMA draw buffers are still the two internal
+  ones from `main.cpp`.
+- `main/CMakeLists.txt`: `WHOLE_ARCHIVE` on the main component. liblvgl references `lv_malloc_core()` & co., main's
+  archive is scanned first and nothing in it uses them, so the linker dropped the object (undefined `lv_mem_init`).
+- `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`: NimBLE host heap (mbufs, GATT/ATT state) in PSRAM. The controller
+  cannot (internal only) and stays there. Both in `sdkconfig` and `sdkconfig.defaults`.
+- `BLEMouse.cpp ble_set_enabled()`: refuses to start when internal SRAM is below 72 KB free / 24 KB largest block
+  (the controller library asserts instead of failing). The Settings handler now returns `bool`; a refused start logs the
+  numbers, keeps `cfg.bluetooth.enabled = false` and un-checks the switch.
+- `main.cpp` mem_info thread: one INFO line every 5 s with SRAM/PSRAM free and largest block
+  (`heap: SRAM .. free / .. max block | PSRAM ..`). `EXAMPLE_SHOW_MEM_INFO = false` silences it.
+
 ## 5. What to do now
 
 1. `idf.py build` (full build, link untested by me).

@@ -65,6 +65,14 @@ esp_err_t bsp_extra_codec_volume_set(int volume, int *volume_set);
 int bsp_extra_codec_volume_get(void);
 
 /**
+ * @brief Whether bsp_extra_codec_init() has completed.
+ *
+ * Lets callers (Settings volume slider) skip esp_codec_dev calls on a NULL
+ * handle before any audio app brought the codec up.
+ */
+bool bsp_extra_codec_is_init(void);
+
+/**
  * @brief Stop I2S function.
  *
  * @return

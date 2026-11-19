@@ -314,39 +314,65 @@ void ClockApp::toggleAod()
 
 void ClockApp::enterLightSleep()
 {
-    ESP_UTILS_LOGI("Enter LIGHT SLEEP");
+    const auto &d = Settings::cfg.display;
+    ESP_UTILS_LOGI("Enter LIGHT SLEEP (dim=%d btn_wake=%d ble=%d)",
+                   (int)d.dim_screen, (int)d.user_button_wake_up, (int)Settings::bluetooth_running);
     _state = State::LIGHT_SLEEP;
 
-    // Make sure display is off before sleeping.
-    setBacklight(false);
+    // Panel: dimmed to the configured level, or off. The SH8601 keeps the
+    // frame in its own RAM, so a dimmed panel goes on showing the last
+    // picture while the chip sleeps.
+    if (d.dim_screen) {
+        Settings::setPanelBrightness(Settings::lightSleepBrightnessPercent());
+    } else {
+        setBacklight(false);
+    }
 
-    // GPIO wakeup: button (GPIO0) and touch INT (GPIO38). Both active LOW.
-    gpio_wakeup_enable(BTN_WAKE_GPIO,  GPIO_INTR_LOW_LEVEL);
+    // Wake sources, both active LOW: touch INT (GPIO38) always, the user
+    // button (GPIO0) only when enabled in Settings.
     gpio_wakeup_enable(TOUCH_INT_GPIO, GPIO_INTR_LOW_LEVEL);
+    if (d.user_button_wake_up) {
+        gpio_wakeup_enable(BTN_WAKE_GPIO, GPIO_INTR_LOW_LEVEL);
+    } else {
+        gpio_wakeup_disable(BTN_WAKE_GPIO);
+    }
     esp_sleep_enable_gpio_wakeup();
 
-    // Timer wakeup so we can escalate to deep sleep at DEEP_SLEEP_IDLE_MS.
-    uint32_t already_idle = lv_disp_get_inactive_time(NULL);
-    uint32_t remain_ms = (DEEP_SLEEP_IDLE_MS > already_idle) ? (DEEP_SLEEP_IDLE_MS - already_idle) : 1000;
-    esp_sleep_enable_timer_wakeup((uint64_t)remain_ms * 1000ULL);
+    // Timer wakeup = what is left of the deep-sleep delay.
+    uint32_t light_ms = (uint32_t)d.light_sleep_delay_s * 1000U;
+    uint32_t deep_ms  = (uint32_t)d.deep_sleep_delay_s  * 1000U;
+    if (deep_ms <= light_ms) deep_ms = light_ms + 1000U;
+    uint32_t already_idle = 0;
+    if (bsp_display_lock(100)) {
+        already_idle = lv_disp_get_inactive_time(NULL);
+        bsp_display_unlock();
+    }
+    uint32_t remain_ms = (deep_ms > already_idle) ? (deep_ms - already_idle) : 1000U;
 
-    // BLOCKS the calling task. Whole chip sleeps until a wake source fires.
-        // enterDeepSleep();
-    esp_light_sleep_start();
+    bool timed_out;
+    if (Settings::bluetooth_running) {
+        // The BLE controller does not survive a forced light sleep (no modem
+        // sleep configured, see sdkconfig). Keep the CPU up: the screen is
+        // already dimmed/off, wait for input or the deep-sleep deadline.
+        timed_out = !waitForInput(remain_ms);
+    } else {
+        esp_sleep_enable_timer_wakeup((uint64_t)remain_ms * 1000ULL);
+        // BLOCKS the calling task. Whole chip sleeps until a wake source fires.
+        esp_light_sleep_start();
+        esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+        ESP_UTILS_LOGI("Light sleep wake cause=%d", (int)cause);
+        timed_out = (cause == ESP_SLEEP_WAKEUP_TIMER);
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    }
 
-    // ---------- Wake ----------
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    ESP_UTILS_LOGI("Light sleep wake cause=%d", (int)cause);
-
-    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-        // No user input for full DEEP_SLEEP_IDLE_MS -> escalate.
-        ESP_UTILS_LOGI("Enter DEEP SLEEP");
+    if (timed_out) {
+        // No user input for the whole deep-sleep delay -> escalate.
         enterDeepSleep();
         // not reached
     }
     ESP_UTILS_LOGI("Exit LIGHT SLEEP");
 
-    // GPIO wake -> bring system back to ACTIVE.
+    // Input -> bring system back to ACTIVE at the user's brightness.
     setBacklight(true);
 
     // We are on the sleep-monitor task here, not LVGL's. Both of these mutate
@@ -361,6 +387,29 @@ void ClockApp::enterLightSleep()
     } else {
         ESP_UTILS_LOGW("Light sleep exit: LVGL lock timeout, UI not restored");
     }
+}
+
+// Stand-in for esp_light_sleep_start() while BLE is up. Input = LVGL's
+// inactivity counter restarted (any touch) or the user button, if enabled.
+bool ClockApp::waitForInput(uint32_t timeout_ms)
+{
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    uint32_t last_idle = UINT32_MAX;
+    while (esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (_stop_sleep_task) return true;
+        if (Settings::cfg.display.user_button_wake_up && gpio_get_level(BTN_WAKE_GPIO) == 0) {
+            return true;
+        }
+        uint32_t idle = last_idle;
+        if (bsp_display_lock(50)) {
+            idle = lv_disp_get_inactive_time(NULL);
+            bsp_display_unlock();
+        }
+        if (idle < last_idle && last_idle != UINT32_MAX) return true;   // counter restarted = touch
+        last_idle = idle;
+    }
+    return false;
 }
 
 ClockApp::DeepSleepHandler ClockApp::_deep_sleep_handler = nullptr;
@@ -397,7 +446,8 @@ void ClockApp::setBacklight(bool on)
     }
 
     if (on) {
-        bsp_display_backlight_on();
+        // The user's brightness (Settings > Display), not the BSP's fixed 100 %.
+        bsp_display_brightness_set(Settings::cfg.display.brightness);
     } else {
         bsp_display_backlight_off();
     }
@@ -603,7 +653,10 @@ void ClockApp::enterDeepSleep()
     esp_sleep_enable_ext1_wakeup(io_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     gpio_deep_sleep_hold_en();
 
-    if (s_pmu_inited) {
+    // With "User button wake-up" on, keep the rails up and let GPIO0 (ext1,
+    // configured above) reboot the watch. A PMU shutdown cuts the ESP32's
+    // own rail, so only the power key could wake it.
+    if (s_pmu_inited && !Settings::cfg.display.user_button_wake_up) {
         ESP_UTILS_LOGI("PMU shutdown -> PEKEY press will reboot the watch");
         s_pmu.setPowerKeyPressOnTime(XPOWERS_POWERON_128MS);
         s_pmu.setPowerKeyPressOffTime(XPOWERS_POWEROFF_4S);
@@ -612,6 +665,7 @@ void ClockApp::enterDeepSleep()
         // Power dies almost immediately. Spin so we don't return.
         for (;;) { vTaskDelay(pdMS_TO_TICKS(100)); }
     }
+    ESP_UTILS_LOGI("ESP deep sleep -> user button (GPIO0) will reboot the watch");
     esp_deep_sleep_start();
 }
 
@@ -760,18 +814,20 @@ void ClockApp::sleepMonitorTask(void *arg)
             continue;   // LVGL busy; check again next tick
         }
 
-        // Threshold comes from the Settings app's persistent config
-        // (saved on SD as /sdcard/.settings.json, value in ms).
-        uint32_t threshold_ms = Settings::cfg.inactivity_delay_ms;
-        if (threshold_ms == 0) threshold_ms = LIGHT_SLEEP_IDLE_MS; // safety
         // Honour any active wake-lock (e.g. Flashlight in foreground).
         if (Settings::sleep_locked) continue;
-        if (idle >= threshold_ms) {
-            // Blocks here until chip wakes. On return, state has been
-            // restored (unless chip went to deep sleep, in which case we
-            // never get here).
-            // self->enterLightSleep();
-            self->enterDeepSleep();
+
+        // Settings > Display (persisted on SD as /sdcard/.settings.json).
+        const auto &d = Settings::cfg.display;
+        if (d.disable_sleep_on_charge && Settings::isCharging()) continue;
+
+        uint32_t light_ms = (uint32_t)d.light_sleep_delay_s * 1000U;
+        if (light_ms == 0) light_ms = LIGHT_SLEEP_IDLE_MS;   // safety
+        if (idle >= light_ms) {
+            // Blocks here until input wakes the chip; escalates to deep
+            // sleep by itself when the deep-sleep delay runs out (never
+            // returns in that case).
+            self->enterLightSleep();
         }
     }
 

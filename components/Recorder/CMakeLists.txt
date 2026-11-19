@@ -31,7 +31,7 @@ idf_component_register(
     INCLUDE_DIRS
         ${CMAKE_CURRENT_LIST_DIR}
         ${CMAKE_CURRENT_LIST_DIR}/ui
-    REQUIRES driver fatfs bsp_extra
+    REQUIRES driver fatfs bsp_extra Settings
     WHOLE_ARCHIVE
 )
 # Prefix common EEZ-Studio global symbols with this app's name so multiple

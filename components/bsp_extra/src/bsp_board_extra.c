@@ -122,6 +122,11 @@ int bsp_extra_codec_volume_get(void)
     return _vloume_intensity;
 }
 
+bool bsp_extra_codec_is_init(void)
+{
+    return _is_audio_init;
+}
+
 esp_err_t bsp_extra_codec_mute_set(bool enable)
 {
     esp_err_t ret = ESP_OK;

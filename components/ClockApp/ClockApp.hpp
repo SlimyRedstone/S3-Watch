@@ -162,6 +162,10 @@ private:
     void enterActive();
     void enterDimmed();
     void enterLightSleep();
+    // Light-sleep stand-in while the BLE stack is up (the controller does not
+    // survive esp_light_sleep_start()). Polls for input; true = input seen,
+    // false = timeout. Returns immediately on the first touch/button.
+    bool waitForInput(uint32_t timeout_ms);
     void enterDeepSleep();
     void prepareDeepSleepPower();
     void wakeFromAnySource();

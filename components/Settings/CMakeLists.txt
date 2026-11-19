@@ -12,7 +12,7 @@ idf_component_register(
         ${CMAKE_CURRENT_LIST_DIR}
         ${CMAKE_CURRENT_LIST_DIR}/ui
         ${CMAKE_CURRENT_LIST_DIR}/icon
-    REQUIRES driver esp_hw_support XPowersLib json fatfs
+    REQUIRES driver esp_hw_support esp_timer XPowersLib json fatfs bsp_extra
     WHOLE_ARCHIVE   # Keep static plugin registrar linked.
 )
 

@@ -16,6 +16,7 @@
 
 #include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
+#include "Settings.hpp"   // persisted speaker volume
 #include "esp_dsp.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -396,7 +397,7 @@ namespace {
 		dsps_wind_hann_f32(s_fft_wind, FFT_N);
 		bsp_extra_codec_init();
 		bsp_extra_player_init();
-		bsp_extra_codec_volume_set(60, NULL);
+		bsp_extra_codec_volume_set(esp_brookesia::apps::Settings::cfg.audio.volume, NULL);
 		s_audio_inited = true;
 	}
 
@@ -437,7 +438,7 @@ void action_play_button_pressed(lv_event_t *e) {
 void action_volume_slider_changed(lv_event_t *e) {
 	lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
 	int v						 = (int)lv_slider_get_value(slider);
-	bsp_extra_codec_volume_set(v, NULL);
+	esp_brookesia::apps::Settings::setVolume(v);   // codec + settings.audio.volume
 }
 
 void action_file_list_selected(lv_event_t *e) { (void)e; }

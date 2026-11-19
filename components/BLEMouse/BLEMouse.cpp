@@ -60,6 +60,7 @@ static uint16_t s_boot_in_h    = 0;
 static uint8_t  s_addr_type    = 0;
 static volatile bool s_connected   = false;
 static volatile bool s_nimble_up   = false;
+static volatile bool s_stopping    = false;   // ble_set_enabled(false) in progress: no UI from gap_event()
 static uint8_t  s_proto_mode  = 1;
 static uint8_t  s_ctrl_pt     = 0;
 static const uint8_t REPORT_ID = 1;
@@ -261,6 +262,57 @@ static esp_err_t ble_mouse_init(const char *name)
     return ESP_OK;
 }
 
+// Settings "Enable Bluetooth" switch (registered via Settings::setBluetoothHandler).
+// Runs on the LVGL task (switch handler) or on the main task at app init.
+// Stopping blocks until the NimBLE host task has exited, a few ms.
+// The BLE controller allocates from internal SRAM only and the library asserts
+// instead of failing when that runs out. Check first; the host heap is in
+// PSRAM (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL), the controller is not.
+static constexpr size_t BLE_MIN_INTERNAL_FREE  = 72 * 1024;
+static constexpr size_t BLE_MIN_INTERNAL_BLOCK = 24 * 1024;
+
+static bool ble_set_enabled(bool enable)
+{
+    using esp_brookesia::apps::Settings;
+    if (enable) {
+        if (s_nimble_up) return true;
+        const size_t free_b  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t block_b = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        if (free_b < BLE_MIN_INTERNAL_FREE || block_b < BLE_MIN_INTERNAL_BLOCK) {
+            ESP_UTILS_LOGE("Bluetooth not started: internal RAM %u free / %u max block (need %u / %u)",
+                           (unsigned)free_b, (unsigned)block_b,
+                           (unsigned)BLE_MIN_INTERNAL_FREE, (unsigned)BLE_MIN_INTERNAL_BLOCK);
+            return false;
+        }
+        if (ble_mouse_init("S3 Watch") != ESP_OK) {
+            ESP_UTILS_LOGE("Bluetooth init failed");
+            return false;
+        }
+        s_nimble_up = true;
+        Settings::bluetooth_running = true;
+        ESP_UTILS_LOGI("Bluetooth on (internal RAM was %u free)", (unsigned)free_b);
+        return true;
+    }
+    if (!s_nimble_up) return true;
+
+    s_stopping = true;                        // gap_event() must not touch LVGL from here on
+    int rc = nimble_port_stop();              // drops links, waits for the host to stop
+    if (rc == 0) {
+        nimble_port_deinit();                 // host + HCI + controller down (memory kept for restart)
+        s_nimble_up = false;
+        Settings::bluetooth_running = false;
+        ESP_UTILS_LOGI("Bluetooth off");
+    } else {
+        ESP_UTILS_LOGW("nimble_port_stop failed: %d", rc);
+    }
+    s_stopping    = false;
+    s_connected   = false;
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_input_h = s_consumer_h = s_boot_in_h = 0;
+    notify_app(false);                        // status-bar icon + app label
+    return !s_nimble_up;
+}
+
 static void send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel = 0)
 {
     if (!s_connected || s_input_h == 0) return;
@@ -355,9 +407,16 @@ BLEMouse::~BLEMouse() { _instance = nullptr; }
 
 bool BLEMouse::init()
 {
-    if (!s_nimble_up/*  && gpio_get_level(BTN_GPIO) == 0 */) {
-        ble_mouse_init("S3 Watch");
-        s_nimble_up = true;
+    // App inits run in registry order, which is not defined: make sure the
+    // saved config is loaded before reading the Bluetooth switch.
+    Settings::ensureLoaded();
+    Settings::setBluetoothHandler(&ble_set_enabled);
+    if (Settings::cfg.bluetooth.enabled) {
+        if (!ble_set_enabled(true)) {
+            ESP_UTILS_LOGW("Bluetooth enabled in Settings but could not start");
+        }
+    } else {
+        ESP_UTILS_LOGI("Bluetooth disabled in Settings, stack not started");
     }
     return true;
 }
@@ -375,6 +434,9 @@ bool BLEMouse::run()
     cfg.intr_type    = GPIO_INTR_DISABLE;
     gpio_config(&cfg);
     _btn_last = _btn_prev = gpio_get_level(BTN_GPIO);
+    if (!s_nimble_up) {
+        ESP_UTILS_LOGW("Bluetooth is off (Settings > Bluetooth); the pad will not send anything");
+    }
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x030303), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -689,5 +751,6 @@ ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, BLEMouse, APP_NAM
 
 static void notify_app(bool connected)
 {
+    if (s_stopping) return;   // the switch handler owns the UI update while stopping
     esp_brookesia::apps::BLEMouse::onConnectionChanged(connected);
 }

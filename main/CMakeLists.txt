@@ -17,8 +17,9 @@ endif()
 
 
 idf_component_register(
-    SRCS 
-        "main.cpp" 
+    SRCS
+        "main.cpp"
+        "lv_mem_core_psram.c"
         # "fonts/jetbrains_48_1bpp.c" 
         # "fonts/jetbrains_60_1bpp.c"
     INCLUDE_DIRS "."
@@ -36,6 +37,11 @@ idf_component_register(
         Recorder
         Podometer
         RemoteNow
+        Sonometer
+    # lv_mem_core_psram.c defines lv_malloc_core() & co. for liblvgl. Nothing
+    # in main references them, and main's archive is scanned before lvgl's,
+    # so without this the linker drops the object (undefined lv_mem_init...).
+    WHOLE_ARCHIVE
 )
 
 target_compile_options(${COMPONENT_LIB} PUBLIC -Wno-missing-field-initializers)

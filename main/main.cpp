@@ -28,7 +28,7 @@ using namespace esp_brookesia;
 using namespace esp_brookesia::gui;
 using namespace esp_brookesia::systems::phone;
 
-constexpr bool EXAMPLE_SHOW_MEM_INFO = true;
+constexpr bool EXAMPLE_SHOW_MEM_INFO = false;
 
 // Run `fn` synchronously on a task pinned to `core` and wait for it.
 //
@@ -87,7 +87,7 @@ extern "C" void app_main(void) {
 
 	bsp_display_cfg_t cfg = {
 		.lvgl_port_cfg = {                                 
-			.task_priority		= 2,         
+			.task_priority		= 1,         
 			.task_stack			= 16 * 1024, 
 			.task_affinity		= 1,        
 			.task_max_sleep_ms 	= 5,       
@@ -261,7 +261,9 @@ extern "C" void app_main(void) {
 						internal_free, internal_total,
 						heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), external_free,
 						external_total);
-				// ESP_UTILS_LOGI("\n%s", buffer);
+				ESP_UTILS_LOGI("heap: SRAM %u free / %u max block | PSRAM %u free / %u max block",
+						(unsigned)internal_free, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+						(unsigned)external_free, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
 				{
 					LvLockGuard gui_guard;

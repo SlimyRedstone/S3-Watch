@@ -1,12 +1,15 @@
 /*
- * Settings app - wires the on-board AXP2101 PMU to the Brookesia status bar
- * battery icon and provides a tiny info page.
+ * Settings app - persistent config on SD, AXP2101 -> status-bar battery icon,
+ * vibration motor, and the glue between the EEZ-generated menu (ui/) and the
+ * hardware. See Settings.hpp for the JSON layout.
  */
 #include "Settings.hpp"
 #include <cstdio>
 #include <cstring>
 #include "bsp/esp-bsp.h"
+#include "bsp_board_extra.h"
 #include "cJSON.h"
+#include "esp_timer.h"
 
 #ifdef ESP_UTILS_LOG_TAG
 #   undef ESP_UTILS_LOG_TAG
@@ -31,6 +34,39 @@ static i2c_master_dev_handle_t s_pmu_dev    = nullptr;
 // The C bridge below lives outside the namespace; pull the class in.
 using esp_brookesia::apps::Settings;
 
+// Text of the label that sits in the same menu row as `widget`. The generated
+// create_slider()/create_switch() build: menu cont { [icon image], label, widget }.
+static const char *row_label_text(lv_obj_t *widget)
+{
+    lv_obj_t *row = widget ? lv_obj_get_parent(widget) : nullptr;
+    if (row == nullptr) return "";
+    uint32_t n = lv_obj_get_child_count(row);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *c = lv_obj_get_child(row, (int32_t)i);
+        if (lv_obj_check_type(c, &lv_label_class)) {
+            const char *t = lv_label_get_text(c);
+            return t ? t : "";
+        }
+    }
+    return "";
+}
+
+// Row titles exactly as the generated ui/screens.c writes them. They are the
+// only handle the generated code gives us: every slider shares one callback
+// with no user data, and the switch callback never calls the setters.
+static constexpr const char *ROW_BRIGHTNESS      = "Brightness";
+static constexpr const char *ROW_DIM             = "Dim screen on light sleep";
+static constexpr const char *ROW_BTN_WAKE        = "User button wake-up";
+static constexpr const char *ROW_NO_SLEEP_CHARGE = "Disable sleep when charging";
+static constexpr const char *ROW_LS_BRIGHTNESS   = "Brightness (Light Sleep)";
+static constexpr const char *ROW_LS_DELAY        = "Time before light sleep";
+static constexpr const char *ROW_DS_DELAY        = "Time before deep sleep";
+static constexpr const char *ROW_VIBRATIONS      = "Vibrations";
+static constexpr const char *ROW_VOLUME          = "Volume";
+static constexpr const char *ROW_WIFI            = "Enable WiFi";
+static constexpr const char *ROW_BLUETOOTH       = "Enable Bluetooth";
+static constexpr const char *ROW_ESPNOW          = "Enable ESP-Now";
+
 extern "C" {
     #include "settings_ui_bridge.h"   // prototypes missing from generated actions.h
     #include "ui.h"
@@ -43,74 +79,38 @@ extern "C" {
     LV_IMG_DECLARE(settings_icon);
     LV_IMG_DECLARE(sd_card_icon);
     LV_IMG_DECLARE(bluetooth_icon_2);   // 16x16, same size as the SD icon
-    // LV_IMG_DECLARE(bluetooth_icon);
-    LV_IMG_DECLARE(bluetooth_icon_2);
 
     // EEZ-generated screens.c calls these C getters/setters. They are plain
     // views over the persistent Settings::cfg (declared inside
     // namespace esp_brookesia::apps, hence the using-declaration above).
     char version_text[64] = {0};
 
-    bool get_dim_screen_value(void) {
-        return Settings::cfg.dim_screen;
-    }
-    void set_dim_screen_value(bool value) {
-        Settings::cfg.dim_screen = value;
+    bool get_dim_screen_value(void)            { return Settings::cfg.display.dim_screen; }
+    void set_dim_screen_value(bool value)      { Settings::cfg.display.dim_screen = value; }
+
+    bool get_user_wake_up_button_value(void)   { return Settings::cfg.display.user_button_wake_up; }
+    void set_user_wake_up_button_value(bool v) { Settings::cfg.display.user_button_wake_up = v; }
+
+    bool get_sleep_charge_button_value(void)   { return Settings::cfg.display.disable_sleep_on_charge; }
+    void set_sleep_charge_button_value(bool v) { Settings::cfg.display.disable_sleep_on_charge = v; }
+
+    bool get_vibrations_value(void)            { return Settings::cfg.audio.vibrations; }
+    void set_vibrations_value(bool value)      { Settings::cfg.audio.vibrations = value; }
+
+    bool get_wifi_value(void)                  { return Settings::cfg.wifi.enabled; }
+    void set_wifi_value(bool value)            { Settings::cfg.wifi.enabled = value; }
+
+    bool get_bluetooth_value(void)             { return Settings::cfg.bluetooth.enabled; }
+    void set_bluetooth_value(bool value)       {
+        Settings::cfg.bluetooth.enabled = value;
+        if (!Settings::applyBluetooth()) Settings::cfg.bluetooth.enabled = false;   // could not start: stay off
     }
 
-    bool get_user_wake_up_button_value(void) {
-        return Settings::cfg.enable_user_button_wake_up;
-    }
-    void set_user_wake_up_button_value(bool value) {
-        if (value) {
-            Settings::sleep_locked = s_pmu.isVbusIn();
-        } else {
-            Settings::sleep_locked = false;
-        }
-        Settings::cfg.enable_user_button_wake_up = value;
-    }
+    bool get_upgrade_value(void)               { return Settings::cfg.upgrade.enabled; }
+    void set_upgrade_value(bool value)         { Settings::cfg.upgrade.enabled = value; }
 
-    bool get_sleep_charge_button_value(void) {
-        return Settings::cfg.disable_sleep_on_charge;
-    }
-    void set_sleep_charge_button_value(bool value) {
-        Settings::cfg.disable_sleep_on_charge = value;
-    }
-
-    bool get_vibrations_value(void) {
-        return Settings::cfg.enable_vibrations;
-    }
-    void set_vibrations_value(bool value) {
-        Settings::cfg.enable_vibrations = value;
-    }
-
-    bool get_wifi_value(void) {
-        return Settings::cfg.enable_wifi;
-    }
-    void set_wifi_value(bool value) {
-        Settings::cfg.enable_wifi = value;
-    }
-
-    bool get_bluetooth_value(void) {
-        return Settings::cfg.enable_bluetooth;
-    }
-    void set_bluetooth_value(bool value) {
-        Settings::cfg.enable_bluetooth = value;
-    }
-
-    bool get_upgrade_value(void) {
-        return Settings::cfg.enable_upgrade;
-    }
-    void set_upgrade_value(bool value) {
-        Settings::cfg.enable_upgrade = value;
-    }
-
-    bool get_espnow_value(void) {
-        return Settings::cfg.enable_espnow;
-    }
-    void set_espnow_value(bool value) {
-        Settings::cfg.enable_espnow = value;
-    }
+    bool get_espnow_value(void)                { return Settings::cfg.espnow.enabled; }
+    void set_espnow_value(bool value)          { Settings::cfg.espnow.enabled = value; }
 
     const char *get_version_value(const char* prefix, const char *suffix) {
         // static: the generated UI keeps the returned pointer (label text),
@@ -132,30 +132,73 @@ extern "C" {
         version_text[sizeof(version_text) - 1] = 0;
     }
 
-
+    // Every switch (LV_EVENT_CLICKED, fired after lv_switch has toggled its
+    // CHECKED state) and the two plain buttons land here.
     void action_button_pressed(lv_event_t *e) {
-        lv_event_code_t code = lv_event_get_code(e);
-        if(code == LV_EVENT_CLICKED) {
-            /* lv_obj_t *button = (lv_obj_t *)lv_event_get_target(e);
-            
-            // buttons_t type = *(buttons_t *)lv_obj_get_user_data(button);
-            switch (type) {
-                case BUTTON_CHECK_UPDATES:
-                    ESP_LOGI(ESP_UTILS_LOG_TAG, "Check updates button pressed");
-                    break;
-                default:
-                case BUTTON_TEST:
-                    ESP_LOGI(ESP_UTILS_LOG_TAG, "Test button pressed");
-                    break;
-                    
-            } */
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+        lv_obj_t *target = (lv_obj_t *)lv_event_get_target(e);
+        if (target == NULL) return;
+
+        if (lv_obj_check_type(target, &lv_switch_class)) {
+            const bool  on   = lv_obj_has_state(target, LV_STATE_CHECKED);
+            const char *name = row_label_text(target);
+            if      (strcmp(name, ROW_DIM) == 0)             set_dim_screen_value(on);
+            else if (strcmp(name, ROW_BTN_WAKE) == 0)        set_user_wake_up_button_value(on);
+            else if (strcmp(name, ROW_NO_SLEEP_CHARGE) == 0) set_sleep_charge_button_value(on);
+            else if (strcmp(name, ROW_VIBRATIONS) == 0)      { set_vibrations_value(on); if (on) Settings::vibrate(); }
+            else if (strcmp(name, ROW_WIFI) == 0)            set_wifi_value(on);
+            else if (strcmp(name, ROW_BLUETOOTH) == 0) {
+                set_bluetooth_value(on);
+                if (on && !Settings::cfg.bluetooth.enabled) {
+                    lv_obj_remove_state(target, LV_STATE_CHECKED);   // start refused: show it
+                }
+            }
+            else if (strcmp(name, ROW_ESPNOW) == 0)          set_espnow_value(on);
+            else { ESP_UTILS_LOGW("switch '%s' not mapped", name); return; }
+            ESP_UTILS_LOGI("switch '%s' -> %d", name, (int)on);
+            Settings::saveLater();
+            return;
+        }
+
+        // Plain buttons carry a buttons_t id in their user data.
+        buttons_t type = (buttons_t)(uintptr_t)lv_obj_get_user_data(target);
+        switch (type) {
+            case BUTTON_CHECK_UPDATES:
+                ESP_UTILS_LOGI("Check updates button pressed");
+                break;
+            case BUTTON_TEST:
+                ESP_UTILS_LOGI("Test button pressed");
+                Settings::vibrate();
+                break;
+            default:
+                break;
         }
     }
-    
+
+    // Every slider (LV_EVENT_VALUE_CHANGED, continuous while dragging).
     void action_slider_changed(lv_event_t *e) {
         lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
-        int v   = (int)lv_slider_get_value(slider);
-        (void)v;   // TODO: wire slider value to a setting
+        if (slider == NULL) return;
+        const int   v    = (int)lv_slider_get_value(slider);
+        const char *name = row_label_text(slider);
+
+        if (strcmp(name, ROW_BRIGHTNESS) == 0) {
+            Settings::cfg.display.brightness = v;
+            Settings::applyBrightness();                 // live
+        } else if (strcmp(name, ROW_LS_BRIGHTNESS) == 0) {
+            Settings::cfg.display.light_sleep_brightness = v;
+        } else if (strcmp(name, ROW_LS_DELAY) == 0) {
+            Settings::cfg.display.light_sleep_delay_s = v;
+        } else if (strcmp(name, ROW_DS_DELAY) == 0) {
+            Settings::cfg.display.deep_sleep_delay_s = v;
+        } else if (strcmp(name, ROW_VOLUME) == 0) {
+            Settings::cfg.audio.volume = v;
+            Settings::applyVolume();                     // live
+        } else {
+            ESP_UTILS_LOGW("slider '%s' not mapped", name);
+            return;
+        }
+        Settings::saveLater();
     }
 }
 static constexpr int SD_ICON_ID = 1001;
@@ -204,8 +247,25 @@ static bool pmu_open()
     s_pmu.setPowerKeyPressOnTime(XPOWERS_POWERON_128MS);
     s_pmu.setPowerKeyPressOffTime(XPOWERS_POWEROFF_4S);
     s_pmu.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_400MA);
-    // s_pmu.setWatchdogConfig()
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// cJSON helpers: tolerant reads with defaults and clamping.
+// ---------------------------------------------------------------------------
+static bool json_bool(cJSON *obj, const char *key, bool def)
+{
+    cJSON *v = cJSON_GetObjectItem(obj, key);
+    return cJSON_IsBool(v) ? cJSON_IsTrue(v) : def;
+}
+
+static int json_int(cJSON *obj, const char *key, int def, int lo, int hi)
+{
+    cJSON *v = cJSON_GetObjectItem(obj, key);
+    int r = cJSON_IsNumber(v) ? v->valueint : def;
+    if (r < lo) r = lo;
+    if (r > hi) r = hi;
+    return r;
 }
 
 namespace esp_brookesia::apps {
@@ -215,14 +275,34 @@ static constexpr char APP_NAME[] = "Settings";
 Settings *Settings::_instance = nullptr;
 Settings::AppConfig Settings::cfg{};   // default-initialized
 volatile bool Settings::sleep_locked = false;
+volatile bool Settings::bluetooth_running = false;
 bool Settings::_bt_connected  = false;
 bool Settings::_bt_icon_shown = false;
-static bool s_sd_mounted = false;
+Settings::BluetoothHandler Settings::_bt_handler = nullptr;
+lv_timer_t *Settings::_save_timer = nullptr;
+static bool s_sd_mounted    = false;
+static bool s_load_attempted = false;
 
 // ---------------------------------------------------------------------------
 // SD-backed config load/save.
-//   { "settings": { "inactivity_delay": <ms> } }
 // ---------------------------------------------------------------------------
+
+bool Settings::ensureLoaded()
+{
+    if (s_load_attempted) return s_sd_mounted;
+    s_load_attempted = true;
+
+    // Best-effort: failures mean defaults / no persistence.
+    if (bsp_sdcard_mount() == ESP_OK) {
+        s_sd_mounted = true;
+        if (!loadFromSd()) {
+            saveToSd();
+        }
+    } else {
+        ESP_UTILS_LOGW("SD mount failed -> using default settings (no persist)");
+    }
+    return s_sd_mounted;
+}
 
 bool Settings::loadFromSd()
 {
@@ -230,7 +310,7 @@ bool Settings::loadFromSd()
     if (f == nullptr) {
         return false;
     }
-    char buf[256] = {};
+    char buf[1024] = {};
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     if (n == 0) return false;
@@ -238,41 +318,44 @@ bool Settings::loadFromSd()
     cJSON *j = cJSON_Parse(buf);
     if (j == nullptr) return false;
 
+    // Items returned by cJSON_GetObjectItem() are owned by `j`; only
+    // cJSON_Delete(j) at the end. Missing sections/keys keep the defaults.
     cJSON *root = cJSON_GetObjectItem(j, "settings");
     if (cJSON_IsObject(root)) {
-        cJSON *d = cJSON_GetObjectItem(root, "inactivity_delay");
-        if (cJSON_IsNumber(d) && d->valueint > 0) {
-            cfg.inactivity_delay_ms = (uint32_t)d->valueint;
+        AppConfig d{};   // defaults
+        cJSON *disp = cJSON_GetObjectItem(root, "display");
+        if (cJSON_IsObject(disp)) {
+            cfg.display.brightness              = json_int (disp, "brightness",              d.display.brightness, 1, 100);
+            cfg.display.dim_screen              = json_bool(disp, "dim_screen",              d.display.dim_screen);
+            cfg.display.user_button_wake_up     = json_bool(disp, "user_button_wake_up",     d.display.user_button_wake_up);
+            cfg.display.disable_sleep_on_charge = json_bool(disp, "disable_sleep_on_charge", d.display.disable_sleep_on_charge);
+            cfg.display.light_sleep_brightness  = json_int (disp, "light_sleep_brightness",  d.display.light_sleep_brightness, 1, 255);
+            cfg.display.light_sleep_delay_s     = json_int (disp, "light_sleep_delay_s",     d.display.light_sleep_delay_s, 5, 30);
+            cfg.display.deep_sleep_delay_s      = json_int (disp, "deep_sleep_delay_s",      d.display.deep_sleep_delay_s, 10, 60);
         }
-
-        // Items returned by cJSON_GetObjectItem() are owned by `j`.
-        // Do NOT cJSON_Delete() them individually: cJSON_Delete() also walks
-        // ->next, so it freed every following sibling and cJSON_Delete(j)
-        // below then double-freed them (heap corruption on boot with SD).
-        cJSON *a0 = cJSON_GetObjectItem(root, "dim_screen");
-        cfg.dim_screen = cJSON_IsBool(a0) && cJSON_IsTrue(a0);
-
-        cJSON *aa = cJSON_GetObjectItem(root, "enable_user_button_wake_up");
-        cfg.enable_user_button_wake_up = cJSON_IsBool(aa) && cJSON_IsTrue(aa);
-
-        cJSON *ab = cJSON_GetObjectItem(root, "disable_sleep_on_charge");
-        cfg.disable_sleep_on_charge = cJSON_IsBool(ab) && cJSON_IsTrue(ab);
-
-        cJSON *ac = cJSON_GetObjectItem(root, "enable_vibrations");
-        cfg.enable_vibrations = cJSON_IsBool(ac) && cJSON_IsTrue(ac);
-
-        cJSON *ad = cJSON_GetObjectItem(root, "enable_wifi");
-        cfg.enable_wifi = cJSON_IsBool(ad) && cJSON_IsTrue(ad);
-
-        cJSON *ae = cJSON_GetObjectItem(root, "enable_bluetooth");
-        cfg.enable_bluetooth = cJSON_IsBool(ae) && cJSON_IsTrue(ae);
-
-        cJSON *af = cJSON_GetObjectItem(root, "enable_espnow");
-        cfg.enable_espnow = cJSON_IsBool(af) && cJSON_IsTrue(af);
+        cJSON *audio = cJSON_GetObjectItem(root, "audio");
+        if (cJSON_IsObject(audio)) {
+            cfg.audio.vibrations            = json_bool(audio, "vibrations",         d.audio.vibrations);
+            cfg.audio.vibration_duration_ms = json_int (audio, "vibration_duration", d.audio.vibration_duration_ms, 1, (int)MOTOR_MAX_ON_MS);
+            cfg.audio.volume                = json_int (audio, "volume",             d.audio.volume, 0, 100);
+        }
+        cJSON *bt = cJSON_GetObjectItem(root, "bluetooth");
+        if (cJSON_IsObject(bt))   cfg.bluetooth.enabled = json_bool(bt, "enabled", d.bluetooth.enabled);
+        cJSON *wifi = cJSON_GetObjectItem(root, "wifi");
+        if (cJSON_IsObject(wifi)) cfg.wifi.enabled = json_bool(wifi, "enabled", d.wifi.enabled);
+        cJSON *now = cJSON_GetObjectItem(root, "espnow");
+        if (cJSON_IsObject(now))  cfg.espnow.enabled = json_bool(now, "enabled", d.espnow.enabled);
+        cJSON *up = cJSON_GetObjectItem(root, "upgrade");
+        if (cJSON_IsObject(up))   cfg.upgrade.enabled = json_bool(up, "enabled", d.upgrade.enabled);
     }
     cJSON_Delete(j);
-    ESP_UTILS_LOGI("Settings loaded: inactivity_delay=%u ms",
-                   (unsigned)cfg.inactivity_delay_ms);
+    ESP_UTILS_LOGI("Settings loaded: brightness=%d dim=%d btn_wake=%d no_sleep_chg=%d ls_bri=%d ls=%ds ds=%ds "
+                   "vib=%d/%dms vol=%d bt=%d wifi=%d espnow=%d",
+                   cfg.display.brightness, (int)cfg.display.dim_screen, (int)cfg.display.user_button_wake_up,
+                   (int)cfg.display.disable_sleep_on_charge, cfg.display.light_sleep_brightness,
+                   cfg.display.light_sleep_delay_s, cfg.display.deep_sleep_delay_s,
+                   (int)cfg.audio.vibrations, cfg.audio.vibration_duration_ms, cfg.audio.volume,
+                   (int)cfg.bluetooth.enabled, (int)cfg.wifi.enabled, (int)cfg.espnow.enabled);
     return true;
 }
 
@@ -284,16 +367,27 @@ bool Settings::saveToSd()
     if (j == nullptr) return false;
     cJSON *root = cJSON_AddObjectToObject(j, "settings");
     if (root == nullptr) { cJSON_Delete(j); return false; }
-    cJSON_AddNumberToObject(root, "inactivity_delay", cfg.inactivity_delay_ms);
-    cJSON_AddBoolToObject(root, "enable_user_button_wake_up", cfg.enable_user_button_wake_up);
-    cJSON_AddBoolToObject(root, "disable_sleep_on_charge", cfg.disable_sleep_on_charge);
-    cJSON_AddBoolToObject(root, "dim_screen", cfg.dim_screen);
-    cJSON_AddBoolToObject(root, "enable_wifi", cfg.enable_wifi);
-    cJSON_AddBoolToObject(root, "enable_bluetooth", cfg.enable_bluetooth);
-    cJSON_AddBoolToObject(root, "enable_espnow", cfg.enable_espnow);
-    cJSON_AddBoolToObject(root, "enable_vibrations", cfg.enable_vibrations);
 
-    char *out = cJSON_Print(j);  // pretty-print to match the shape user wants
+    cJSON *disp = cJSON_AddObjectToObject(root, "display");
+    cJSON_AddNumberToObject(disp, "brightness",              cfg.display.brightness);
+    cJSON_AddBoolToObject  (disp, "dim_screen",              cfg.display.dim_screen);
+    cJSON_AddBoolToObject  (disp, "user_button_wake_up",     cfg.display.user_button_wake_up);
+    cJSON_AddBoolToObject  (disp, "disable_sleep_on_charge", cfg.display.disable_sleep_on_charge);
+    cJSON_AddNumberToObject(disp, "light_sleep_brightness",  cfg.display.light_sleep_brightness);
+    cJSON_AddNumberToObject(disp, "light_sleep_delay_s",     cfg.display.light_sleep_delay_s);
+    cJSON_AddNumberToObject(disp, "deep_sleep_delay_s",      cfg.display.deep_sleep_delay_s);
+
+    cJSON *audio = cJSON_AddObjectToObject(root, "audio");
+    cJSON_AddBoolToObject  (audio, "vibrations",         cfg.audio.vibrations);
+    cJSON_AddNumberToObject(audio, "vibration_duration", cfg.audio.vibration_duration_ms);
+    cJSON_AddNumberToObject(audio, "volume",             cfg.audio.volume);
+
+    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "bluetooth"), "enabled", cfg.bluetooth.enabled);
+    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "wifi"),      "enabled", cfg.wifi.enabled);
+    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "espnow"),    "enabled", cfg.espnow.enabled);
+    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "upgrade"),   "enabled", cfg.upgrade.enabled);
+
+    char *out = cJSON_Print(j);  // pretty-printed
     cJSON_Delete(j);
     if (out == nullptr) return false;
 
@@ -306,9 +400,182 @@ bool Settings::saveToSd()
     fputs(out, f);
     fclose(f);
     cJSON_free(out);
-    ESP_UTILS_LOGI("Settings saved: inactivity_delay=%u ms",
-                   (unsigned)cfg.inactivity_delay_ms);
+    ESP_UTILS_LOGI("Settings saved");
     return true;
+}
+
+// Sliders fire VALUE_CHANGED for every pixel of a drag. Collapse a burst
+// into one SD write, SAVE_DEBOUNCE_MS after the last change.
+void Settings::saveLater()
+{
+    if (_save_timer == nullptr) {
+        _save_timer = lv_timer_create(&Settings::onSaveTimer, SAVE_DEBOUNCE_MS, nullptr);
+        if (_save_timer == nullptr) { saveToSd(); return; }
+    }
+    lv_timer_reset(_save_timer);
+    lv_timer_resume(_save_timer);
+}
+
+void Settings::onSaveTimer(lv_timer_t *t)
+{
+    lv_timer_pause(t);
+    saveToSd();
+}
+
+// ---------------------------------------------------------------------------
+// Apply helpers
+// ---------------------------------------------------------------------------
+
+void Settings::setPanelBrightness(int percent)
+{
+    if (percent < 0)   percent = 0;
+    if (percent > 100) percent = 100;
+
+    // The brightness command (0x51) goes over the same QSPI handle as the
+    // LVGL flush and that handle has no locking of its own: serialise with
+    // the LVGL task. The port mutex is recursive, so this is also fine from
+    // the LVGL task itself. Before the display exists there is no lock to
+    // take and the BSP call is a no-op (it checks its panel handle).
+    const bool lvgl_up = (lv_display_get_default() != nullptr);
+    bool locked = false;
+    if (lvgl_up) {
+        locked = bsp_display_lock(1000);
+        if (!locked) ESP_UTILS_LOGW("Brightness: LVGL lock timeout, proceeding unlocked");
+    }
+    bsp_display_brightness_set(percent);
+    if (locked) bsp_display_unlock();
+}
+
+void Settings::applyBrightness()
+{
+    setPanelBrightness(cfg.display.brightness);
+}
+
+int Settings::lightSleepBrightnessPercent()
+{
+    int v = cfg.display.light_sleep_brightness;        // slider range 1..255
+    int pct = (v * 100 + 127) / 255;
+    if (pct < 1)   pct = 1;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
+void Settings::applyVolume()
+{
+    if (!bsp_extra_codec_is_init()) return;             // Recorder brings the codec up lazily
+    bsp_extra_codec_volume_set(cfg.audio.volume, nullptr);
+}
+
+void Settings::setVolume(int volume)
+{
+    if (volume < 0)   volume = 0;
+    if (volume > 100) volume = 100;
+    cfg.audio.volume = volume;
+    applyVolume();
+    saveLater();
+}
+
+void Settings::setBluetoothHandler(BluetoothHandler handler)
+{
+    _bt_handler = handler;
+}
+
+bool Settings::applyBluetooth()
+{
+    if (_bt_handler == nullptr) {
+        ESP_UTILS_LOGW("Bluetooth: no handler registered (BLE app not installed)");
+        return false;
+    }
+    return _bt_handler(cfg.bluetooth.enabled);
+}
+
+bool Settings::isCharging()
+{
+    if (!s_pmu_inited) return false;
+    return s_pmu.isVbusIn();
+}
+
+// ---------------------------------------------------------------------------
+// Vibration motor (GPIO18, active high). One esp_timer turns it off; a new
+// tick while one is running just extends it.
+// ---------------------------------------------------------------------------
+static esp_timer_handle_t s_motor_timer = nullptr;
+static bool               s_motor_ready = false;
+
+static bool motor_prepare()
+{
+    if (s_motor_ready) return true;
+
+    gpio_set_level(Settings::MOTOR_GPIO, 0);           // latch low before enabling the driver
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << Settings::MOTOR_GPIO;
+    io.mode         = GPIO_MODE_OUTPUT;
+    io.pull_up_en   = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type    = GPIO_INTR_DISABLE;
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_UTILS_LOGE("Motor GPIO%d config failed", (int)Settings::MOTOR_GPIO);
+        return false;
+    }
+    gpio_set_level(Settings::MOTOR_GPIO, 0);
+
+    esp_timer_create_args_t ta = {};
+    ta.callback = &Settings::onMotorOff;
+    ta.arg      = nullptr;
+    ta.name     = "motor_off";
+    if (esp_timer_create(&ta, &s_motor_timer) != ESP_OK) {
+        ESP_UTILS_LOGE("Motor timer create failed");
+        return false;
+    }
+    s_motor_ready = true;
+    return true;
+}
+
+void Settings::onMotorOff(void * /*arg*/)
+{
+    gpio_set_level(MOTOR_GPIO, 0);
+}
+
+void Settings::vibrate(uint32_t ms)
+{
+    if (!cfg.audio.vibrations) return;
+    if (ms == 0) ms = (uint32_t)cfg.audio.vibration_duration_ms;
+    if (ms == 0) return;
+    if (ms > MOTOR_MAX_ON_MS) ms = MOTOR_MAX_ON_MS;
+    if (!motor_prepare()) return;
+
+    esp_timer_stop(s_motor_timer);                     // ESP_ERR_INVALID_STATE if idle: fine
+    gpio_set_level(MOTOR_GPIO, 1);
+    if (esp_timer_start_once(s_motor_timer, (uint64_t)ms * 1000ULL) != ESP_OK) {
+        gpio_set_level(MOTOR_GPIO, 0);                 // never leave the motor running
+    }
+}
+
+// Haptic tick on press of an interactive element. Registered on the pointer
+// indev, so it covers every app and the launcher without touching them.
+// The pressed object arrives as the event parameter (lv_indev.c send_event()).
+// Plain containers are clickable by default in LVGL, so only real widgets and
+// images/labels that were made clickable on purpose (launcher icons) count.
+void Settings::onIndevPressed(lv_event_t *e)
+{
+    lv_obj_t *obj = static_cast<lv_obj_t *>(lv_event_get_param(e));
+    if (obj == nullptr) obj = lv_indev_get_active_obj();
+    if (obj == nullptr || lv_obj_get_parent(obj) == nullptr) return;   // nothing / a screen
+
+    static const lv_obj_class_t *const kWidgets[] = {
+        &lv_button_class, &lv_switch_class, &lv_slider_class, &lv_checkbox_class,
+        &lv_dropdown_class, &lv_roller_class, &lv_textarea_class, &lv_imagebutton_class,
+        &lv_buttonmatrix_class, &lv_arc_class, &lv_spinbox_class, &lv_keyboard_class,
+        &lv_menu_cont_class,
+    };
+    bool hit = false;
+    for (auto *cls : kWidgets) {
+        if (lv_obj_check_type(obj, cls)) { hit = true; break; }
+    }
+    if (!hit && (lv_obj_check_type(obj, &lv_image_class) || lv_obj_check_type(obj, &lv_label_class))) {
+        hit = lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    }
+    if (hit) vibrate();
 }
 
 Settings *Settings::requestInstance(bool use_status_bar, bool use_navigation_bar)
@@ -344,13 +611,7 @@ bool Settings::init()
 
     pmu_open();
 
-    // Try to mount the SD card. Best-effort: failures are silently ignored
-    // and we fall back to defaults / no persistence.
-    if (bsp_sdcard_mount() == ESP_OK) {
-        s_sd_mounted = true;
-        if (!loadFromSd()) {
-            saveToSd();
-        }
+    if (ensureLoaded()) {
         auto *phone = getSystem();
         if (phone) {
             auto *bar = phone->getDisplay().getStatusBar();
@@ -362,8 +623,6 @@ bool Settings::init()
                 bar->addIcon(icon, /*area_index=*/2, SD_ICON_ID);
             }
         }
-    } else {
-        ESP_UTILS_LOGW("SD mount failed -> using default settings (no persist)");
     }
 
     // Long-lived LV timer that pushes battery state to the status bar.
@@ -372,7 +631,12 @@ bool Settings::init()
     }
     onStatusTimer(_status_timer);
 
-    Settings::sleep_locked = s_pmu.isVbusIn();
+    // Haptic feedback hook on every pointer input device.
+    for (lv_indev_t *ind = lv_indev_get_next(nullptr); ind != nullptr; ind = lv_indev_get_next(ind)) {
+        if (lv_indev_get_type(ind) == LV_INDEV_TYPE_POINTER) {
+            lv_indev_add_event_cb(ind, &Settings::onIndevPressed, LV_EVENT_PRESSED, nullptr);
+        }
+    }
 
     return true;
 }
@@ -387,64 +651,34 @@ bool Settings::deinit()
     return true;
 }
 
+// The generated create_slider() hard-codes the initial slider values. Walk
+// the screen once after creation and overwrite them with the saved config.
+// Switches already read their state through the get_*_value() getters.
+void Settings::syncSlidersFromCfg(lv_obj_t *root)
+{
+    if (root == nullptr) return;
+    if (lv_obj_check_type(root, &lv_slider_class)) {
+        const char *name = row_label_text(root);
+        int v = -1;
+        if      (strcmp(name, ROW_BRIGHTNESS) == 0)    v = cfg.display.brightness;
+        else if (strcmp(name, ROW_LS_BRIGHTNESS) == 0) v = cfg.display.light_sleep_brightness;
+        else if (strcmp(name, ROW_LS_DELAY) == 0)      v = cfg.display.light_sleep_delay_s;
+        else if (strcmp(name, ROW_DS_DELAY) == 0)      v = cfg.display.deep_sleep_delay_s;
+        else if (strcmp(name, ROW_VOLUME) == 0)        v = cfg.audio.volume;
+        if (v >= 0) lv_slider_set_value(root, v, LV_ANIM_OFF);
+        return;
+    }
+    uint32_t n = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < n; i++) {
+        syncSlidersFromCfg(lv_obj_get_child(root, (int32_t)i));
+    }
+}
+
 bool Settings::run()
 {
     ESP_UTILS_LOGD("Run");
     Settings_ui_init();
-    /* 
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-
-    _lbl_title = lv_label_create(scr);
-    lv_label_set_text(_lbl_title, "Settings");
-    lv_obj_set_style_text_color(_lbl_title, lv_color_white(), 0);
-    lv_obj_set_style_text_font(_lbl_title, &lv_font_montserrat_24, 0);
-    lv_obj_align(_lbl_title, LV_ALIGN_TOP_MID, 0, 30);
-
-    _lbl_pct = lv_label_create(scr);
-    lv_obj_set_style_text_color(_lbl_pct, lv_color_white(), 0);
-    lv_obj_set_style_text_font(_lbl_pct, &lv_font_montserrat_18, 0);
-    lv_obj_align(_lbl_pct, LV_ALIGN_CENTER, 0, -30);
-
-    _lbl_volt = lv_label_create(scr);
-    lv_obj_set_style_text_color(_lbl_volt, lv_color_hex(0xA0A0A0), 0);
-    lv_obj_set_style_text_font(_lbl_volt, &lv_font_montserrat_18, 0);
-    lv_obj_align(_lbl_volt, LV_ALIGN_CENTER, 0, 0);
-
-    _lbl_charge = lv_label_create(scr);
-    lv_obj_set_style_text_color(_lbl_charge, lv_color_hex(0xA0A0A0), 0);
-    lv_obj_set_style_text_font(_lbl_charge, &lv_font_montserrat_18, 0);
-    lv_obj_align(_lbl_charge, LV_ALIGN_CENTER, 0, 30);
-
-    // ---- Inactivity delay row: label + minus / plus buttons ----
-    _lbl_delay = lv_label_create(scr);
-    lv_obj_set_style_text_color(_lbl_delay, lv_color_white(), 0);
-    lv_obj_set_style_text_font(_lbl_delay, &lv_font_montserrat_18, 0);
-    lv_obj_align(_lbl_delay, LV_ALIGN_CENTER, 0, 80);
-
-    lv_obj_t *btn_minus = lv_btn_create(scr);
-    lv_obj_set_size(btn_minus, 40, 40);
-    lv_obj_align(btn_minus, LV_ALIGN_CENTER, -90, 130);
-    lv_obj_t *lbl_minus = lv_label_create(btn_minus);
-    lv_label_set_text(lbl_minus, "-");
-    lv_obj_center(lbl_minus);
-    lv_obj_add_event_cb(btn_minus, &Settings::onDelayMinusClicked, LV_EVENT_CLICKED, this);
-
-    lv_obj_t *btn_plus = lv_btn_create(scr);
-    lv_obj_set_size(btn_plus, 40, 40);
-    lv_obj_align(btn_plus, LV_ALIGN_CENTER, 90, 130);
-    lv_obj_t *lbl_plus = lv_label_create(btn_plus);
-    lv_label_set_text(lbl_plus, "+");
-    lv_obj_center(lbl_plus);
-    lv_obj_add_event_cb(btn_plus, &Settings::onDelayPlusClicked, LV_EVENT_CLICKED, this);
-
-    refreshUi();
-
-    // 1s UI timer - only ticks while app foreground (auto-cleaned on close).
-    _ui_timer = lv_timer_create(&Settings::onUiTimer, 1000, this);
-     */
+    syncSlidersFromCfg(Settings_objects.main);
     return true;
 }
 
@@ -521,73 +755,6 @@ void Settings::syncBluetoothIcon()
     } else {
         bar->removeIcon(BT_ICON_ID);
         _bt_icon_shown = false;
-    }
-}
-
-void Settings::onUiTimer(lv_timer_t *t)
-{
-    auto *self = static_cast<Settings *>(lv_timer_get_user_data(t));
-    if (self == nullptr) return;
-    self->refreshUi();
-}
-
-void Settings::refreshUi()
-{
-    if (!s_pmu_inited) return;
-    if (_lbl_pct == nullptr) return;
-
-    char buf[48];
-
-    if (s_pmu.isBatteryConnect()) {
-        snprintf(buf, sizeof(buf), "Battery: %d %%", (int)s_pmu.getBatteryPercent());
-    } else {
-        snprintf(buf, sizeof(buf), "Battery: not connected");
-    }
-    lv_label_set_text(_lbl_pct, buf);
-
-    snprintf(buf, sizeof(buf), "Voltage: %d mV", (int)s_pmu.getBattVoltage());
-    lv_label_set_text(_lbl_volt, buf);
-
-    const char *state = "discharging";
-    if (s_pmu.isCharging())          state = "charging";
-    else if (s_pmu.isVbusIn())       state = "USB connected";
-    else if (s_pmu.isStandby())      state = "standby";
-    snprintf(buf, sizeof(buf), "State: %s", state);
-    lv_label_set_text(_lbl_charge, buf);
-
-    if (_lbl_delay != nullptr) {
-        // Show as seconds (1 decimal) for readability; the underlying value
-        // and the JSON file are stored in milliseconds.
-        snprintf(buf, sizeof(buf), "Inactivity delay: %.1f s",
-                 cfg.inactivity_delay_ms / 1000.0f);
-        lv_label_set_text(_lbl_delay, buf);
-    }
-}
-
-// Step size for + / - buttons (ms). Min/max bound the slider.
-static constexpr uint32_t DELAY_STEP_MS = 5000;
-static constexpr uint32_t DELAY_MIN_MS  = 5000;
-static constexpr uint32_t DELAY_MAX_MS  = 600000;
-
-void Settings::onDelayMinusClicked(lv_event_t *e)
-{
-    auto *self = static_cast<Settings *>(lv_event_get_user_data(e));
-    if (self == nullptr) return;
-    if (cfg.inactivity_delay_ms > DELAY_MIN_MS) {
-        cfg.inactivity_delay_ms -= DELAY_STEP_MS;
-        saveToSd();
-        self->refreshUi();
-    }
-}
-
-void Settings::onDelayPlusClicked(lv_event_t *e)
-{
-    auto *self = static_cast<Settings *>(lv_event_get_user_data(e));
-    if (self == nullptr) return;
-    if (cfg.inactivity_delay_ms < DELAY_MAX_MS) {
-        cfg.inactivity_delay_ms += DELAY_STEP_MS;
-        saveToSd();
-        self->refreshUi();
     }
 }
 
