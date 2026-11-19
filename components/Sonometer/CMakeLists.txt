@@ -26,3 +26,11 @@ set_source_files_properties(
     PROPERTIES
         COMPILE_FLAGS "-Wno-missing-field-initializers"
 )
+
+# EEZ Studio generates no actions.h for this project: ui/screens.c gets the action prototypes
+# from Sonometer_actions.h, force-included, so the exported ui/ files are used unchanged
+set_source_files_properties(
+    ${CMAKE_CURRENT_LIST_DIR}/ui/screens.c
+    PROPERTIES
+        COMPILE_OPTIONS "-include;${CMAKE_CURRENT_LIST_DIR}/Sonometer_actions.h"
+)

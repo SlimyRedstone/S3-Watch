@@ -62,20 +62,34 @@ static_assert(SOUND_UPDATE_RATE_HZ > 0 && SOUND_UPDATE_RATE_HZ <= 1000, "SOUND_U
       draw task per bar per refresh stripe (3-4 fps at 128+ bars)
 @note Levels in dB SPL per bin, with the level's calibration: a pure tone reads about 1.8 dB below its level on a 1-bin bar,
       lower on bars averaging many bins
+@note dB range = fft_min_sens_slider .. fft_max_sens_slider (Options tab, action fft_options_slider_changed)
+@note fft_frequency_scale sections are drawn as bands over the plot (their main style's line colour and opacity):
+      LVGL 9.2.2 draws horizontal scale sections at uninitialised x positions, so the scale's own section line is hidden
 */
 #define FFT_SIZE                    CONFIG_DSP_MAX_FFT_SIZE // esp-dsp table size (menuconfig: DSP_MAX_FFT_SIZE)
 #define FFT_BINS                    (FFT_SIZE / 2)
-#define FFT_UPDATE_PERIOD_MS        33                  // 30 spectra per second, each one spans FFT_SIZE samples (171 ms @ 8192)
+#define FFT_UPDATE_PERIOD_MS        20                  // 30 spectra per second, each one spans FFT_SIZE samples (171 ms @ 8192)
 #define FFT_GRAPH_COLOR_HEX         0xFFFFFF
 #define FFT_GRAPH_GAP_FROM_PX       4                   // bars at least this wide get a 1 px gap on their right
-#define FFT_GRAPH_DB_MIN            0                   // dB SPL per bin, bottom of the chart
-#define FFT_GRAPH_DB_MAX            100                 // dB SPL per bin, top of the chart
+#define FFT_GRAPH_DB_MIN            0                   // dB SPL per bin, bottom of the chart, when the UI has no fft_min_sens_slider
+#define FFT_GRAPH_DB_MAX            100                 // dB SPL per bin, top of the chart, when the UI has no fft_max_sens_slider
 #define FFT_GRAPH_F_MIN             20                  // Hz, left end, when the UI has no fft_frequency_scale
 #define FFT_GRAPH_F_MAX             20000               // Hz, right end, when the UI has no fft_frequency_scale
 #define FFT_GRAPH_BARS_DEFAULT      32                  // when the UI has no n_bars_selector
 #define FFT_SCALE_UNITS_PER_OCTAVE  1000                // fft_frequency_scale range unit once it is logarithmic
 #define FFT_SCALE_LABELS_MAX        32
+#define FFT_SCALE_BANDS_MAX         8                   // fft_frequency_scale sections drawn as bands
 static_assert(FFT_SIZE >= 256 && (FFT_SIZE & (FFT_SIZE - 1)) == 0, "FFT_SIZE must be a power of 2");
+
+/*
+@brief FFT peaks (Sonometer_objects.fft_peaks_list): strongest local maxima of the spectrum, "%0.0fHz (%0.1fdB)", strongest first
+@note Row count from fft_peaks_n_selector, hidden with fft_options_peaks_disabled_switch (EEZ variable fft_peaks_list_disabled)
+@note Searched in the bins (5.86 Hz @ 8192) within the fft_frequency_scale range, interpolated between bins
+@note Level = dB SPL of a pure tone at that frequency (window's coherent gain), a tone reads its level (1.8 dB above a 1-bin bar)
+*/
+#define FFT_PEAKS_MAX               16                  // rows kept at most
+#define FFT_PEAKS_DEFAULT           3                   // when the UI has no fft_peaks_n_selector
+#define FFT_PEAKS_UPDATE_PERIOD_MS  250                 // list refresh, slower than the bars so the values stay readable
 
 /*
 @brief EEZ variables refresh (Sonometer_ui_tick), same period as the original display loop

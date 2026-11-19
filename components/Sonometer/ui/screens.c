@@ -346,14 +346,51 @@ void Sonometer_create_screen_main() {
                                     lv_obj_set_style_radius(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
                                     lv_obj_set_style_bg_color(obj, lv_color_hex(0x4c4c4c), LV_PART_MAIN | LV_STATE_DEFAULT);
                                     lv_obj_set_style_bg_opa(obj, 80, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_radius(obj, 0, LV_PART_ITEMS | LV_STATE_DEFAULT);
                                 }
                                 {
-                                    // fft_controls
+                                    // fft_peaks_list
+                                    lv_obj_t *obj = lv_list_create(parent_obj);
+                                    Sonometer_objects.fft_peaks_list = obj;
+                                    lv_obj_set_pos(obj, 25, 302);
+                                    lv_obj_set_size(obj, 360, 100);
+                                }
+                            }
+                        }
+                    }
+                }
+                {
+                    // fft_options
+                    lv_obj_t *obj = lv_tabview_add_tab(parent_obj, "Options");
+                    Sonometer_objects.fft_options = obj;
+                    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+                    {
+                        lv_obj_t *parent_obj = obj;
+                        {
+                            // options_container
+                            lv_obj_t *obj = lv_obj_create(parent_obj);
+                            Sonometer_objects.options_container = obj;
+                            lv_obj_set_pos(obj, -16, -16);
+                            lv_obj_set_size(obj, 410, 422);
+                            lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_bg_opa(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_radius(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+                            lv_obj_set_style_flex_track_place(obj, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_flex_flow(obj, LV_FLEX_FLOW_COLUMN, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            lv_obj_set_style_layout(obj, LV_LAYOUT_FLEX, LV_PART_MAIN | LV_STATE_DEFAULT);
+                            {
+                                lv_obj_t *parent_obj = obj;
+                                {
+                                    // fft_bars_controls
                                     lv_obj_t *obj = lv_obj_create(parent_obj);
-                                    Sonometer_objects.fft_controls = obj;
-                                    lv_obj_set_pos(obj, 13, 300);
-                                    lv_obj_set_size(obj, 384, 86);
-                                    lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    Sonometer_objects.fft_bars_controls = obj;
+                                    lv_obj_set_pos(obj, 142, 62);
+                                    lv_obj_set_size(obj, 410, 67);
                                     lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
                                     lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
                                     lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -366,6 +403,7 @@ void Sonometer_create_screen_main() {
                                     lv_obj_set_style_flex_main_place(obj, LV_FLEX_ALIGN_START, LV_PART_MAIN | LV_STATE_DEFAULT);
                                     lv_obj_set_style_flex_cross_place(obj, LV_FLEX_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
                                     lv_obj_set_style_flex_track_place(obj, LV_FLEX_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_left(obj, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
                                     {
                                         lv_obj_t *parent_obj = obj;
                                         {
@@ -383,11 +421,223 @@ void Sonometer_create_screen_main() {
                                             lv_obj_t *obj = lv_dropdown_create(parent_obj);
                                             Sonometer_objects.n_bars_selector = obj;
                                             lv_obj_set_pos(obj, 181, 24);
-                                            lv_obj_set_size(obj, 96, LV_SIZE_CONTENT);
-                                            lv_dropdown_set_options_static(obj, "32\n128\n1024\n4096");
+                                            lv_obj_set_size(obj, 67, LV_SIZE_CONTENT);
+                                            lv_dropdown_set_options_static(obj, "16\n32\n64\n128\n512");
                                             lv_dropdown_set_dir(obj, LV_DIR_RIGHT);
                                             lv_dropdown_set_symbol(obj, LV_SYMBOL_RIGHT);
                                             lv_dropdown_set_selected(obj, 0);
+                                            lv_obj_set_style_text_font(obj, &lv_font_montserrat_18, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                        }
+                                    }
+                                }
+                                {
+                                    // options_spearator_1
+                                    lv_obj_t *obj = lv_line_create(parent_obj);
+                                    Sonometer_objects.options_spearator_1 = obj;
+                                    lv_obj_set_pos(obj, 0, 0);
+                                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                    static lv_point_precise_t Sonometer_line_points[] = {
+                                        { 0, 0 },
+                                        { 410, 0 }
+                                    };
+                                    lv_line_set_points(obj, Sonometer_line_points, 2);
+                                    lv_obj_set_style_line_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_line_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_line_dash_gap(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_line_dash_width(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                }
+                                {
+                                    // fft_range_controls
+                                    lv_obj_t *obj = lv_obj_create(parent_obj);
+                                    Sonometer_objects.fft_range_controls = obj;
+                                    lv_obj_set_pos(obj, -420, 76);
+                                    lv_obj_set_size(obj, 410, 168);
+                                    lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_bg_opa(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_radius(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_layout(obj, LV_LAYOUT_FLEX, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_flex_flow(obj, LV_FLEX_FLOW_COLUMN, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_flex_main_place(obj, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    {
+                                        lv_obj_t *parent_obj = obj;
+                                        {
+                                            // min_sensitivity_container
+                                            lv_obj_t *obj = lv_obj_create(parent_obj);
+                                            Sonometer_objects.min_sensitivity_container = obj;
+                                            lv_obj_set_pos(obj, 0, 0);
+                                            lv_obj_set_size(obj, 410, 75);
+                                            lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_bg_opa(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_radius(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+                                            {
+                                                lv_obj_t *parent_obj = obj;
+                                                {
+                                                    // fft_min_sens_label
+                                                    lv_obj_t *obj = lv_label_create(parent_obj);
+                                                    Sonometer_objects.fft_min_sens_label = obj;
+                                                    lv_obj_set_pos(obj, 15, 4);
+                                                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                                    lv_obj_set_style_text_font(obj, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                                    lv_label_set_text_static(obj, "Min. sensitivity:");
+                                                }
+                                                {
+                                                    // fft_min_sens_slider
+                                                    lv_obj_t *obj = lv_slider_create(parent_obj);
+                                                    Sonometer_objects.fft_min_sens_slider = obj;
+                                                    lv_obj_set_pos(obj, 15, 45);
+                                                    lv_obj_set_size(obj, 379, 19);
+                                                    lv_slider_set_range(obj, -100, 30);
+                                                    lv_slider_set_value(obj, -48, LV_ANIM_OFF);
+                                                    lv_obj_add_event_cb(obj, action_fft_options_slider_changed, LV_EVENT_VALUE_CHANGED, (void *)0);
+                                                }
+                                                {
+                                                    // fft_min_sens_value_label
+                                                    lv_obj_t *obj = lv_label_create(parent_obj);
+                                                    Sonometer_objects.fft_min_sens_value_label = obj;
+                                                    lv_obj_set_pos(obj, 205, 4);
+                                                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                                    lv_obj_set_style_text_font(obj, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                                    lv_label_set_text(obj, "");
+                                                }
+                                            }
+                                        }
+                                        {
+                                            // options_spearator_2
+                                            lv_obj_t *obj = lv_line_create(parent_obj);
+                                            Sonometer_objects.options_spearator_2 = obj;
+                                            lv_obj_set_pos(obj, 0, LV_PCT(0));
+                                            lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                            static lv_point_precise_t Sonometer_line_points[] = {
+                                                { 15, 0 },
+                                                { 394, 0 }
+                                            };
+                                            lv_line_set_points(obj, Sonometer_line_points, 2);
+                                            lv_obj_set_style_line_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_line_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                        }
+                                        {
+                                            // max_sensitivity_container
+                                            lv_obj_t *obj = lv_obj_create(parent_obj);
+                                            Sonometer_objects.max_sensitivity_container = obj;
+                                            lv_obj_set_pos(obj, 0, 0);
+                                            lv_obj_set_size(obj, 410, 75);
+                                            lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_bg_opa(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_set_style_radius(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+                                            {
+                                                lv_obj_t *parent_obj = obj;
+                                                {
+                                                    // fft_max_sens_label
+                                                    lv_obj_t *obj = lv_label_create(parent_obj);
+                                                    Sonometer_objects.fft_max_sens_label = obj;
+                                                    lv_obj_set_pos(obj, 15, 4);
+                                                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                                    lv_obj_set_style_text_font(obj, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                                    lv_label_set_text_static(obj, "Max. sensitivity:");
+                                                }
+                                                {
+                                                    // fft_max_sens_slider
+                                                    lv_obj_t *obj = lv_slider_create(parent_obj);
+                                                    Sonometer_objects.fft_max_sens_slider = obj;
+                                                    lv_obj_set_pos(obj, 15, 45);
+                                                    lv_obj_set_size(obj, 379, 19);
+                                                    lv_slider_set_range(obj, 0, 90);
+                                                    lv_slider_set_value(obj, 16, LV_ANIM_OFF);
+                                                    lv_obj_add_event_cb(obj, action_fft_options_slider_changed, LV_EVENT_VALUE_CHANGED, (void *)0);
+                                                }
+                                                {
+                                                    // fft_max_sens_value_label
+                                                    lv_obj_t *obj = lv_label_create(parent_obj);
+                                                    Sonometer_objects.fft_max_sens_value_label = obj;
+                                                    lv_obj_set_pos(obj, 205, 4);
+                                                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                                    lv_obj_set_style_text_font(obj, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                                    lv_label_set_text(obj, "");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                {
+                                    // options_spearator_3
+                                    lv_obj_t *obj = lv_line_create(parent_obj);
+                                    Sonometer_objects.options_spearator_3 = obj;
+                                    lv_obj_set_pos(obj, 0, 0);
+                                    lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                    static lv_point_precise_t Sonometer_line_points[] = {
+                                        { 0, 0 },
+                                        { 410, 0 }
+                                    };
+                                    lv_line_set_points(obj, Sonometer_line_points, 2);
+                                    lv_obj_set_style_line_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_line_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_line_dash_gap(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_line_dash_width(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                }
+                                {
+                                    // fft_peaks_controls
+                                    lv_obj_t *obj = lv_obj_create(parent_obj);
+                                    Sonometer_objects.fft_peaks_controls = obj;
+                                    lv_obj_set_pos(obj, 0, 0);
+                                    lv_obj_set_size(obj, 410, 120);
+                                    lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_bg_opa(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    lv_obj_set_style_radius(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                    {
+                                        lv_obj_t *parent_obj = obj;
+                                        {
+                                            // fft_peaks_options_label
+                                            lv_obj_t *obj = lv_label_create(parent_obj);
+                                            Sonometer_objects.fft_peaks_options_label = obj;
+                                            lv_obj_set_pos(obj, 15, 9);
+                                            lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                            lv_obj_set_style_text_font(obj, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_label_set_text_static(obj, "Hide FFT peaks:");
+                                        }
+                                        {
+                                            // fft_options_peaks_disabled_switch
+                                            lv_obj_t *obj = lv_switch_create(parent_obj);
+                                            Sonometer_objects.fft_options_peaks_disabled_switch = obj;
+                                            lv_obj_set_pos(obj, 205, 8);
+                                            lv_obj_set_size(obj, 50, 25);
+                                        }
+                                        {
+                                            // fft_n_peaks_options_label
+                                            lv_obj_t *obj = lv_label_create(parent_obj);
+                                            Sonometer_objects.fft_n_peaks_options_label = obj;
+                                            lv_obj_set_pos(obj, 15, 59);
+                                            lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                                            lv_obj_set_style_text_font(obj, &lv_font_montserrat_22, LV_PART_MAIN | LV_STATE_DEFAULT);
+                                            lv_label_set_text_static(obj, "Number of peaks:");
+                                        }
+                                        {
+                                            // fft_peaks_n_selector
+                                            lv_obj_t *obj = lv_dropdown_create(parent_obj);
+                                            Sonometer_objects.fft_peaks_n_selector = obj;
+                                            lv_obj_set_pos(obj, 227, 49);
+                                            lv_obj_set_size(obj, 57, LV_SIZE_CONTENT);
+                                            lv_dropdown_set_options_static(obj, "1\n3\n5\n10");
+                                            lv_dropdown_set_dir(obj, LV_DIR_RIGHT);
+                                            lv_dropdown_set_symbol(obj, LV_SYMBOL_RIGHT);
+                                            lv_dropdown_set_selected(obj, 1);
                                             lv_obj_set_style_text_font(obj, &lv_font_montserrat_18, LV_PART_MAIN | LV_STATE_DEFAULT);
                                         }
                                     }
@@ -412,6 +662,37 @@ void Sonometer_tick_screen_main() {
         if (strcmp(new_val, cur_val) != 0) {
             Sonometer_tick_value_change_obj = Sonometer_objects.sound_label;
             lv_label_set_text(Sonometer_objects.sound_label, new_val);
+            Sonometer_tick_value_change_obj = NULL;
+        }
+    }
+    {
+        bool new_val = get_var_fft_peaks_list_disabled();
+        bool cur_val = lv_obj_has_flag(Sonometer_objects.fft_peaks_list, LV_OBJ_FLAG_HIDDEN);
+        if (new_val != cur_val) {
+            Sonometer_tick_value_change_obj = Sonometer_objects.fft_peaks_list;
+            if (new_val) {
+                lv_obj_add_flag(Sonometer_objects.fft_peaks_list, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_remove_flag(Sonometer_objects.fft_peaks_list, LV_OBJ_FLAG_HIDDEN);
+            }
+            Sonometer_tick_value_change_obj = NULL;
+        }
+    }
+    {
+        const char *new_val = get_var_fft_min_sensitivity_value();
+        const char *cur_val = lv_label_get_text(Sonometer_objects.fft_min_sens_value_label);
+        if (strcmp(new_val, cur_val) != 0) {
+            Sonometer_tick_value_change_obj = Sonometer_objects.fft_min_sens_value_label;
+            lv_label_set_text(Sonometer_objects.fft_min_sens_value_label, new_val);
+            Sonometer_tick_value_change_obj = NULL;
+        }
+    }
+    {
+        const char *new_val = get_var_fft_max_sensitivity_value();
+        const char *cur_val = lv_label_get_text(Sonometer_objects.fft_max_sens_value_label);
+        if (strcmp(new_val, cur_val) != 0) {
+            Sonometer_tick_value_change_obj = Sonometer_objects.fft_max_sens_value_label;
+            lv_label_set_text(Sonometer_objects.fft_max_sens_value_label, new_val);
             Sonometer_tick_value_change_obj = NULL;
         }
     }
