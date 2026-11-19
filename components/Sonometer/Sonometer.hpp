@@ -3,6 +3,7 @@
 #include "esp_brookesia.hpp"
 #include "esp_log.h"
 #include "lvgl.h"
+#include "sdkconfig.h"
 
 /*
 @brief Microphone input: ES7210 ADC, MIC1 on the left slot, MIC2 on the right slot
@@ -45,10 +46,36 @@ static_assert(SOUND_UPDATE_RATE_HZ > 0 && SOUND_UPDATE_RATE_HZ <= 1000, "SOUND_U
 #define SOUND_GRAPH_PERIOD_MS       1000
 #define SOUND_GRAPH_COLOR_HEX       0xFFFFFF
 #define SOUND_GRAPH_POINTS          60                  // 60 s of history at one point per second
-#define SOUND_GRAPH_Y_MIN           30                  // dB, bottom of the chart
-#define SOUND_GRAPH_Y_MAX           120                 // dB, top of the chart (louder peaks leave the plot area)
-#define SOUND_GRAPH_DIV_H           5                   // horizontal grid lines
+#define SOUND_GRAPH_Y_MIN           30                  // dB, bottom of the chart, when the UI has no graph_scale
+#define SOUND_GRAPH_Y_MAX           105                 // dB, top of the chart, when the UI has no graph_scale
+#define SOUND_GRAPH_DIV_H           5                   // horizontal grid lines, when the UI has no graph_scale
 #define SOUND_GRAPH_DIV_V           6                   // vertical grid lines
+
+/*
+@brief FFT graph (Sonometer_objects.fft_graph): live spectrum, bars on a logarithmic frequency axis
+@note FFT of the last FFT_SIZE raw mic samples (no A-weighting), DC removed, Hann window, while the FFT tab is shown
+@note Real input: an FFT_SIZE-point FFT gives FFT_BINS distinct bins (the upper half mirrors them): 4096 bins of 5.86 Hz @ 8192
+@note Bars split the fft_frequency_scale range (Hz, set in the UI) into equal frequency ratios, their count comes from n_bars_selector;
+      a bar is the mean power of the bins centred in it, interpolated between the 2 nearest bins when it is narrower than a bin
+@note More bars than plot pixels: one column per pixel, showing the highest bar it covers
+@note The bars are rendered into one RGB565A8 image drawn over the chart: a bar series would cost LVGL 9.2 one rounded-rect
+      draw task per bar per refresh stripe (3-4 fps at 128+ bars)
+@note Levels in dB SPL per bin, with the level's calibration: a pure tone reads about 1.8 dB below its level on a 1-bin bar,
+      lower on bars averaging many bins
+*/
+#define FFT_SIZE                    CONFIG_DSP_MAX_FFT_SIZE // esp-dsp table size (menuconfig: DSP_MAX_FFT_SIZE)
+#define FFT_BINS                    (FFT_SIZE / 2)
+#define FFT_UPDATE_PERIOD_MS        33                  // 30 spectra per second, each one spans FFT_SIZE samples (171 ms @ 8192)
+#define FFT_GRAPH_COLOR_HEX         0xFFFFFF
+#define FFT_GRAPH_GAP_FROM_PX       4                   // bars at least this wide get a 1 px gap on their right
+#define FFT_GRAPH_DB_MIN            0                   // dB SPL per bin, bottom of the chart
+#define FFT_GRAPH_DB_MAX            100                 // dB SPL per bin, top of the chart
+#define FFT_GRAPH_F_MIN             20                  // Hz, left end, when the UI has no fft_frequency_scale
+#define FFT_GRAPH_F_MAX             20000               // Hz, right end, when the UI has no fft_frequency_scale
+#define FFT_GRAPH_BARS_DEFAULT      32                  // when the UI has no n_bars_selector
+#define FFT_SCALE_UNITS_PER_OCTAVE  1000                // fft_frequency_scale range unit once it is logarithmic
+#define FFT_SCALE_LABELS_MAX        32
+static_assert(FFT_SIZE >= 256 && (FFT_SIZE & (FFT_SIZE - 1)) == 0, "FFT_SIZE must be a power of 2");
 
 /*
 @brief EEZ variables refresh (Sonometer_ui_tick), same period as the original display loop
@@ -62,6 +89,14 @@ static_assert(SOUND_UPDATE_RATE_HZ > 0 && SOUND_UPDATE_RATE_HZ <= 1000, "SOUND_U
 #define SOUND_TASK_PRIORITY         3
 #define SOUND_TASK_CORE             0
 #define SOUND_TASK_STOP_TIMEOUT_MS  1500                // > one codec read timeout (1000 ms)
+
+/*
+@brief FFT task, created and stopped with the sound task, idle while the FFT tab is hidden
+@note Same core, lower priority than the sound task: the level loop always preempts it
+*/
+#define FFT_TASK_STACK_SIZE         (4 * 1024)
+#define FFT_TASK_PRIORITY           2
+#define FFT_TASK_CORE               0
 
 namespace esp_brookesia::apps {
 

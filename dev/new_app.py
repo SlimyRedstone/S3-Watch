@@ -20,7 +20,7 @@ MAIN_CMAKE     = PROJECT_ROOT / "main" / "CMakeLists.txt"
 
 EEZ_FILES = [
     "template.eez-project",
-    "template.eez-project-ui-state",
+    # "template.eez-project-ui-state",
 ]
 
 
