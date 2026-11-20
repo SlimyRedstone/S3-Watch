@@ -12,6 +12,8 @@
 #include "bsp_board_extra.h"
 #include "cJSON.h"
 #include "esp_timer.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #if LV_USE_PERF_MONITOR
 #include "src/display/lv_display_private.h"            // perf_label / perf timer: LVGL 9.2 has no public toggle
 #include "src/others/sysmon/lv_sysmon_private.h"
@@ -70,6 +72,8 @@ static constexpr const char *ROW_DS_DELAY        = "Time before deep sleep";
 static constexpr const char *ROW_VIBRATIONS      = "Vibrations";
 static constexpr const char *ROW_VOLUME          = "Volume";
 static constexpr const char *ROW_WIFI            = "Enable WiFi";
+static constexpr const char *ROW_WIFI_BOOT_OFF   = "Disable WiFi on boot";
+static constexpr const char *IP_LABEL_PREFIX     = "IP Address: ";   // get_wifi_ip_address() text, found again by it
 static constexpr const char *ROW_BLUETOOTH       = "Enable Bluetooth";
 static constexpr const char *ROW_ESPNOW          = "Enable ESP-Now";
 static constexpr const char *ROW_PERF_COUNTER    = "Enable Performance counter";
@@ -106,7 +110,33 @@ extern "C" {
     void set_vibrations_value(bool value)      { Settings::cfg.audio.vibrations = value; }
 
     bool get_wifi_value(void)                  { return Settings::cfg.wifi.enabled; }
-    void set_wifi_value(bool value)            { Settings::cfg.wifi.enabled = value; Settings::refreshWifiIcon(); }
+    void set_wifi_value(bool value)            {
+        Settings::cfg.wifi.enabled = value;
+        Settings::applyWifi();                         // connect / stand by / stop, per wifi.disabled_on_boot
+        Settings::refreshWifiIcon();
+    }
+
+    // WiFi > "Disable WiFi on boot". Same rule as at boot: off -> connect now
+    // (if Wi-Fi is enabled); on -> standby, radio off once no app needs it.
+    bool get_wifi_disable_on_boot_value(void)  { return Settings::cfg.wifi.disabled_on_boot; }
+    void set_wifi_disable_on_boot_value(bool v) {
+        Settings::cfg.wifi.disabled_on_boot = v;
+        Settings::applyWifi();
+    }
+
+    // WiFi > IP address row. Static buffer: lv_label_set_text() copies it.
+    // Settings::refreshIpLabel() keeps the row current while the menu is open.
+    const char *get_wifi_ip_address(void) {
+        static char txt[48];
+        char ip[16];
+        if (Settings::wifiIpText(ip, sizeof(ip))) {
+            snprintf(txt, sizeof(txt), "%s%s", IP_LABEL_PREFIX, ip);
+        } else {
+            snprintf(txt, sizeof(txt), "%s%s", IP_LABEL_PREFIX,
+                     (Settings::wifiStatus() == Settings::WifiStatus::CONNECTING) ? "connecting..." : "not connected");
+        }
+        return txt;
+    }
 
     bool get_bluetooth_value(void)             { return Settings::cfg.bluetooth.enabled; }
     void set_bluetooth_value(bool value)       {
@@ -166,6 +196,7 @@ extern "C" {
             else if (strcmp(name, ROW_NO_SLEEP_CHARGE) == 0) set_sleep_charge_button_value(on);
             else if (strcmp(name, ROW_VIBRATIONS) == 0)      { set_vibrations_value(on); if (on) Settings::vibrate(); }
             else if (strcmp(name, ROW_WIFI) == 0)            set_wifi_value(on);
+            else if (strcmp(name, ROW_WIFI_BOOT_OFF) == 0)   set_wifi_disable_on_boot_value(on);
             else if (strcmp(name, ROW_BLUETOOTH) == 0) {
                 set_bluetooth_value(on);
                 if (on && !Settings::cfg.bluetooth.enabled) {
@@ -265,6 +296,7 @@ static bool pmu_open()
     }
     s_pmu.enableBattVoltageMeasure();
     s_pmu.enableSystemVoltageMeasure();
+    s_pmu.enableVbusVoltageMeasure();                  // Battery > "USB voltage"
     s_pmu_inited = true;
     s_pmu.setPowerKeyPressOnTime(XPOWERS_POWERON_128MS);
     s_pmu.setPowerKeyPressOffTime(XPOWERS_POWEROFF_4S);
@@ -290,6 +322,18 @@ static int json_int(cJSON *obj, const char *key, int def, int lo, int hi)
     return r;
 }
 
+// strlcpy that never cuts a UTF-8 character in half (names may have accents).
+static void copy_utf8(char *dst, size_t dst_len, const char *src)
+{
+    size_t n = strlen(src);
+    if (n >= dst_len) {
+        n = dst_len - 1;
+        while (n > 0 && ((uint8_t)src[n] & 0xC0) == 0x80) n--;    // src[n] is a continuation byte
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 namespace esp_brookesia::apps {
 
 static constexpr char APP_NAME[] = "Settings";
@@ -304,53 +348,185 @@ Settings::BluetoothHandler Settings::_bt_handler = nullptr;
 lv_timer_t *Settings::_save_timer = nullptr;
 static bool s_sd_mounted    = false;
 static bool s_load_attempted = false;
-static bool s_save_after_load = false;   // the file lacks a key with a default worth writing (upgrade.src_url)
-static constexpr size_t CFG_FILE_MAX = 4096;
+static uint32_t s_sd_hash   = 0;             // hash of the text the SD file holds (0 = unknown: write it)
+static constexpr size_t CFG_FILE_MAX = 8192; // 10 Wi-Fi networks with 64-char keys still fit
 
 // ---------------------------------------------------------------------------
-// SD-backed config load/save.
+// Config storage: SD file (primary, user-editable) + NVS copy (fallback).
 // ---------------------------------------------------------------------------
+
+static uint32_t text_hash(const char *s)     // FNV-1a, never 0
+{
+    uint32_t h = 2166136261u;
+    for (; *s != '\0'; s++) {
+        h ^= (uint8_t)*s;
+        h *= 16777619u;
+    }
+    return (h != 0) ? h : 1;
+}
+
+static bool nvs_ready()
+{
+    static bool ok = false;
+    if (ok) return true;
+    esp_err_t e = nvs_flash_init();                     // ESP_OK when already done (BLEMouse, Podometer)
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_UTILS_LOGW("NVS partition unusable (%s): erased", esp_err_to_name(e));
+        nvs_flash_erase();
+        e = nvs_flash_init();
+    }
+    ok = (e == ESP_OK);
+    if (!ok) ESP_UTILS_LOGE("NVS init failed (%s): no settings copy in flash", esp_err_to_name(e));
+    return ok;
+}
+
+// Whole file in a heap buffer (caller frees), nullptr if missing or empty.
+// Heap, not stack: this runs on the main task (3.5 KB stack).
+static char *read_sd_file(const char *path, bool *exists)
+{
+    *exists = false;
+    FILE *f = fopen(path, "r");
+    if (f == nullptr) return nullptr;
+    *exists = true;
+    char *buf = (char *)calloc(1, CFG_FILE_MAX);
+    if (buf == nullptr) {
+        fclose(f);
+        return nullptr;
+    }
+    const size_t n = fread(buf, 1, CFG_FILE_MAX - 1, f);
+    fclose(f);
+    if (n == CFG_FILE_MAX - 1) ESP_UTILS_LOGW("%s is larger than %u B, truncated", path, (unsigned)CFG_FILE_MAX);
+    if (n == 0) {
+        free(buf);
+        return nullptr;
+    }
+    return buf;
+}
+
+// Flash copy in a heap buffer (caller frees), nullptr if there is none.
+static char *read_flash_copy()
+{
+    if (!nvs_ready()) return nullptr;
+    nvs_handle_t h;
+    if (nvs_open(Settings::CFG_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return nullptr;   // never saved
+    size_t len = 0;
+    char *buf = nullptr;
+    if (nvs_get_blob(h, Settings::CFG_NVS_KEY, nullptr, &len) == ESP_OK && len > 0 && len < CFG_FILE_MAX) {
+        buf = (char *)calloc(1, len + 1);
+        if (buf != nullptr && nvs_get_blob(h, Settings::CFG_NVS_KEY, buf, &len) != ESP_OK) {
+            free(buf);
+            buf = nullptr;
+        }
+    }
+    nvs_close(h);
+    return buf;
+}
+
+// Writes the flash copy unless it already holds exactly this text (flash wear).
+static bool write_flash_copy(const char *text)
+{
+    char *old = read_flash_copy();
+    const bool same = (old != nullptr && strcmp(old, text) == 0);
+    free(old);
+    if (same) return true;
+    if (!nvs_ready()) return false;
+
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(Settings::CFG_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        e = nvs_set_blob(h, Settings::CFG_NVS_KEY, text, strlen(text));   // no terminator: read_flash_copy() adds it
+        if (e == ESP_OK) e = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (e != ESP_OK) {
+        ESP_UTILS_LOGE("Settings copy to flash failed (%s)", esp_err_to_name(e));
+        return false;
+    }
+    ESP_UTILS_LOGI("Settings copied to flash");
+    return true;
+}
+
+static bool write_sd_file(const char *text)
+{
+    FILE *f = fopen(Settings::CFG_PATH, "w");
+    if (f == nullptr) {
+        ESP_UTILS_LOGW("Settings save to SD failed: cannot open %s (card removed?)", Settings::CFG_PATH);
+        return false;
+    }
+    const bool ok = (fputs(text, f) >= 0);
+    if (fclose(f) != 0 || !ok) {
+        ESP_UTILS_LOGW("Settings save to SD failed: write error");
+        return false;
+    }
+    return true;
+}
 
 bool Settings::ensureLoaded()
 {
     if (s_load_attempted) return s_sd_mounted;
     s_load_attempted = true;
+    nvs_ready();
 
-    // Best-effort: failures mean defaults / no persistence.
+    // 1. SD file. A file that is not JSON (bad hand edit, write cut by a
+    //    power loss) is kept aside for the user instead of being overwritten.
+    const char *source = nullptr;
     if (bsp_sdcard_mount() == ESP_OK) {
         s_sd_mounted = true;
-        if (!loadFromSd() || s_save_after_load) {
-            saveToSd();
+        bool exists = false;
+        char *text = read_sd_file(CFG_PATH, &exists);
+        if (text != nullptr && loadFromText(text)) {
+            source = "SD card";
+            s_sd_hash = text_hash(text);
+        } else if (exists) {
+            remove(CFG_BAD_PATH);
+            const bool kept = (rename(CFG_PATH, CFG_BAD_PATH) == 0);
+            ESP_UTILS_LOGE("%s is not valid JSON%s", CFG_PATH, kept ? ", renamed to .settings.bad.json" : "");
         }
+        free(text);
     } else {
-        ESP_UTILS_LOGW("SD mount failed -> using default settings (no persist)");
+        ESP_UTILS_LOGW("SD card not mounted: settings from the copy in flash");
     }
+
+    // 2. Flash copy (no SD card, no file, or a broken file).
+    if (source == nullptr) {
+        char *text = read_flash_copy();
+        if (text != nullptr && loadFromText(text)) source = "flash";
+        else if (text != nullptr) ESP_UTILS_LOGE("Settings copy in flash is not valid JSON");
+        free(text);
+    }
+    if (source == nullptr) {
+        ESP_UTILS_LOGW("No saved settings: defaults");
+        wifiListFromJson(nullptr);
+    }
+    ESP_UTILS_LOGI("Settings source: %s", (source != nullptr) ? source : "defaults");
+
+    // 3. SD file and flash copy in line with cfg: restores a missing SD file,
+    //    adds keys missing from an older file, mirrors SD edits to flash.
+    save();
     return s_sd_mounted;
 }
 
-bool Settings::loadFromSd()
+bool Settings::loadFromText(const char *text)
 {
-    FILE *f = fopen(CFG_PATH, "r");
-    if (f == nullptr) {
-        return false;
-    }
-    // Heap, not stack: this runs on the main task (3.5 KB stack) and the file
-    // is past 1 KB since the upgrade URL was added.
-    char *buf = (char *)calloc(1, CFG_FILE_MAX);
-    if (buf == nullptr) {
-        fclose(f);
-        return false;
-    }
-    size_t n = fread(buf, 1, CFG_FILE_MAX - 1, f);
-    fclose(f);
-    if (n == CFG_FILE_MAX - 1) ESP_UTILS_LOGW("%s is larger than %u B, truncated", CFG_PATH, (unsigned)CFG_FILE_MAX);
-    cJSON *j = (n > 0) ? cJSON_Parse(buf) : nullptr;
-    free(buf);
+    cJSON *j = cJSON_Parse(text);
     if (j == nullptr) return false;
 
     // Items returned by cJSON_GetObjectItem() are owned by `j`; only
     // cJSON_Delete(j) at the end. Missing sections/keys keep the defaults.
     cJSON *root = cJSON_GetObjectItem(j, "settings");
+
+    // Device name: settings.device.name, else a top-level device.name (older
+    // hand-written files). save() writes it under settings.
+    cJSON *name = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "device"), "name");
+    if (!cJSON_IsString(name)) name = cJSON_GetObjectItem(cJSON_GetObjectItem(j, "device"), "name");
+    if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
+        copy_utf8(cfg.device.name, sizeof(cfg.device.name), name->valuestring);
+        if (strlen(name->valuestring) >= sizeof(cfg.device.name)) {
+            ESP_UTILS_LOGW("device.name longer than %u bytes, cut to '%s'", (unsigned)(sizeof(cfg.device.name) - 1),
+                           cfg.device.name);
+        }
+    }
+
     if (cJSON_IsObject(root)) {
         AppConfig d{};   // defaults
         cJSON *disp = cJSON_GetObjectItem(root, "display");
@@ -372,7 +548,11 @@ bool Settings::loadFromSd()
         cJSON *bt = cJSON_GetObjectItem(root, "bluetooth");
         if (cJSON_IsObject(bt))   cfg.bluetooth.enabled = json_bool(bt, "enabled", d.bluetooth.enabled);
         cJSON *wifi = cJSON_GetObjectItem(root, "wifi");
-        if (cJSON_IsObject(wifi)) cfg.wifi.enabled = json_bool(wifi, "enabled", d.wifi.enabled);
+        if (cJSON_IsObject(wifi)) {
+            cfg.wifi.enabled          = json_bool(wifi, "enabled",          d.wifi.enabled);
+            cfg.wifi.disabled_on_boot = json_bool(wifi, "disabled_on_boot", d.wifi.disabled_on_boot);
+        }
+        wifiListFromJson(cJSON_IsObject(wifi) ? wifi : nullptr);
         cJSON *now = cJSON_GetObjectItem(root, "espnow");
         if (cJSON_IsObject(now))  cfg.espnow.enabled = json_bool(now, "enabled", d.espnow.enabled);
         cJSON *bat = cJSON_GetObjectItem(root, "battery");
@@ -385,8 +565,7 @@ bool Settings::loadFromSd()
             strlen(src->valuestring) < sizeof(cfg.upgrade.src_url)) {
             strcpy(cfg.upgrade.src_url, src->valuestring);
         } else {
-            strcpy(cfg.upgrade.src_url, d.upgrade.src_url);
-            s_save_after_load = true;                  // write the default so the key shows up in the file
+            strcpy(cfg.upgrade.src_url, d.upgrade.src_url);   // save() then writes the default into the file
         }
         cJSON *dev = cJSON_GetObjectItem(root, "developer");
         if (cJSON_IsObject(dev))  cfg.developer.performance_counter =
@@ -394,23 +573,24 @@ bool Settings::loadFromSd()
     }
     cJSON_Delete(j);
     ESP_UTILS_LOGI("Settings loaded: brightness=%d dim=%d btn_wake=%d no_sleep_chg=%d ls_bri=%d ls=%ds ds=%ds "
-                   "vib=%d/%dms vol=%d bt=%d wifi=%d espnow=%d",
+                   "vib=%d/%dms vol=%d bt=%d wifi=%d (boot %s, %d networks) espnow=%d",
                    cfg.display.brightness, (int)cfg.display.dim_screen, (int)cfg.display.user_button_wake_up,
                    (int)cfg.display.disable_sleep_on_charge, cfg.display.light_sleep_brightness,
                    cfg.display.light_sleep_delay_s, cfg.display.deep_sleep_delay_s,
                    (int)cfg.audio.vibrations, cfg.audio.vibration_duration_ms, cfg.audio.volume,
-                   (int)cfg.bluetooth.enabled, (int)cfg.wifi.enabled, (int)cfg.espnow.enabled);
+                   (int)cfg.bluetooth.enabled, (int)cfg.wifi.enabled, cfg.wifi.disabled_on_boot ? "off" : "on",
+                   wifiNetworkCount(), (int)cfg.espnow.enabled);
     return true;
 }
 
-bool Settings::saveToSd()
+char *Settings::buildJson()
 {
-    if (!s_sd_mounted) return false;   // skip silently when no SD
-
     cJSON *j = cJSON_CreateObject();
-    if (j == nullptr) return false;
+    if (j == nullptr) return nullptr;
     cJSON *root = cJSON_AddObjectToObject(j, "settings");
-    if (root == nullptr) { cJSON_Delete(j); return false; }
+    if (root == nullptr) { cJSON_Delete(j); return nullptr; }
+
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(root, "device"), "name", cfg.device.name);
 
     cJSON *disp = cJSON_AddObjectToObject(root, "display");
     cJSON_AddNumberToObject(disp, "brightness",              cfg.display.brightness);
@@ -427,7 +607,10 @@ bool Settings::saveToSd()
     cJSON_AddNumberToObject(audio, "volume",             cfg.audio.volume);
 
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "bluetooth"), "enabled", cfg.bluetooth.enabled);
-    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "wifi"),      "enabled", cfg.wifi.enabled);
+    cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
+    cJSON_AddBoolToObject(wifi, "enabled",          cfg.wifi.enabled);
+    cJSON_AddBoolToObject(wifi, "disabled_on_boot", cfg.wifi.disabled_on_boot);
+    wifiListToJson(wifi);
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "espnow"),    "enabled", cfg.espnow.enabled);
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "battery"),   "show_percentage", cfg.battery.show_percentage);
     cJSON *up = cJSON_AddObjectToObject(root, "upgrade");
@@ -438,28 +621,41 @@ bool Settings::saveToSd()
 
     char *out = cJSON_Print(j);  // pretty-printed
     cJSON_Delete(j);
-    if (out == nullptr) return false;
+    return out;
+}
 
-    FILE *f = fopen(CFG_PATH, "w");
-    if (f == nullptr) {
-        cJSON_free(out);
-        ESP_UTILS_LOGW("Settings save failed: fopen failed");
+// One JSON text for both media. The SD file is rewritten only when the text
+// differs from what it holds (s_sd_hash), the flash copy only when it differs
+// from the stored blob. A failed SD write (card pulled out) still updates flash.
+bool Settings::save()
+{
+    char *text = buildJson();
+    if (text == nullptr) {
+        ESP_UTILS_LOGE("Settings save failed: out of memory");
         return false;
     }
-    fputs(out, f);
-    fclose(f);
-    cJSON_free(out);
-    ESP_UTILS_LOGI("Settings saved");
-    return true;
+    bool ok = true;
+    const uint32_t h = text_hash(text);
+    if (s_sd_mounted && h != s_sd_hash) {
+        if (write_sd_file(text)) {
+            s_sd_hash = h;
+            ESP_UTILS_LOGI("Settings saved to SD");
+        } else {
+            ok = false;
+        }
+    }
+    if (!write_flash_copy(text)) ok = false;
+    cJSON_free(text);
+    return ok;
 }
 
 // Sliders fire VALUE_CHANGED for every pixel of a drag. Collapse a burst
-// into one SD write, SAVE_DEBOUNCE_MS after the last change.
+// into one write, SAVE_DEBOUNCE_MS after the last change.
 void Settings::saveLater()
 {
     if (_save_timer == nullptr) {
         _save_timer = lv_timer_create(&Settings::onSaveTimer, SAVE_DEBOUNCE_MS, nullptr);
-        if (_save_timer == nullptr) { saveToSd(); return; }
+        if (_save_timer == nullptr) { save(); return; }
     }
     lv_timer_reset(_save_timer);
     lv_timer_resume(_save_timer);
@@ -468,7 +664,7 @@ void Settings::saveLater()
 void Settings::onSaveTimer(lv_timer_t *t)
 {
     lv_timer_pause(t);
-    saveToSd();
+    save();
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +780,27 @@ bool Settings::isCharging()
 {
     if (!s_pmu_inited) return false;
     return s_pmu.isVbusIn();
+}
+
+// Raw PMU readings for SettingsBattery.cpp. Register reads only (no state in
+// XPowersPMU), and the I2C master driver locks the bus: callable from the
+// LVGL task and ClockApp's sleep task alike.
+bool Settings::readBatteryInfo(BatteryInfo &out)
+{
+    out = {};
+    out.soc = -1;
+    if (!s_pmu_inited) return false;
+    out.pmu          = true;
+    out.battery      = s_pmu.isBatteryConnect();
+    out.vbus         = s_pmu.isVbusIn();
+    out.charge_state = (uint8_t)s_pmu.getChargerStatus();
+    if (out.battery) {
+        const int pct = s_pmu.getBatteryPercent();     // -1 on a read error
+        out.soc     = (pct < 0) ? -1 : std::min(pct, 100);
+        out.vbat_mv = s_pmu.getBattVoltage();
+    }
+    out.vbus_mv = out.vbus ? s_pmu.getVbusVoltage() : 0;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +933,12 @@ bool Settings::init()
         }
     }
 
+    // Wi-Fi: connect now, or stand by for an app's request (wifi.disabled_on_boot).
+    applyWifi();
+
+    // Battery statistics (estimated current / life) from NVS, ready after ensureLoaded().
+    batteryInit();
+
     // Performance counter visibility from the saved config (hidden by default).
     applyPerformanceCounter();
 
@@ -778,11 +1001,67 @@ void Settings::syncSlidersFromCfg(lv_obj_t *root)
     }
 }
 
+// The IP address row is a plain label built from get_wifi_ip_address() once,
+// when the menu is created. Found again by its prefix after each build, then
+// rewritten by the status timer when the address changes. The DELETE event
+// (menu closed) drops the pointer.
+static lv_obj_t *s_ip_label = nullptr;
+
+static void ip_label_deleted_cb(lv_event_t *e)
+{
+    if (lv_event_get_target_obj(e) == s_ip_label) s_ip_label = nullptr;
+}
+
+static lv_obj_t *find_label_with_prefix(lv_obj_t *root, const char *prefix)
+{
+    if (root == nullptr) return nullptr;
+    if (lv_obj_check_type(root, &lv_label_class)) {
+        const char *t = lv_label_get_text(root);
+        return (t != nullptr && strncmp(t, prefix, strlen(prefix)) == 0) ? root : nullptr;
+    }
+    const uint32_t n = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *hit = find_label_with_prefix(lv_obj_get_child(root, (int32_t)i), prefix);
+        if (hit != nullptr) return hit;
+    }
+    return nullptr;
+}
+
+void Settings::refreshIpLabel()
+{
+    if (s_ip_label == nullptr) return;
+    const char *now = get_wifi_ip_address();
+    const char *shown = lv_label_get_text(s_ip_label);
+    if (shown == nullptr || strcmp(shown, now) != 0) lv_label_set_text(s_ip_label, now);
+}
+
+// Every row label of the menu is built with LV_LABEL_LONG_SCROLL_CIRCULAR
+// (ui/screens.c create_text()). A label wider than its row then scrolls for
+// ever: its area is re-rendered and flushed on every refresh period (16 ms),
+// for each such row on the shown page and the sidebar, which kept the LVGL
+// task 50-60 % busy while the menu just sat there. Wrapped text is drawn once.
+static void labels_stop_scrolling(lv_obj_t *root)
+{
+    if (root == nullptr) return;
+    if (lv_obj_check_type(root, &lv_label_class)) {
+        if (lv_label_get_long_mode(root) == LV_LABEL_LONG_SCROLL_CIRCULAR) {
+            lv_label_set_long_mode(root, LV_LABEL_LONG_WRAP);     // also deletes the scroll animation
+        }
+        return;
+    }
+    const uint32_t n = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < n; i++) labels_stop_scrolling(lv_obj_get_child(root, (int32_t)i));
+}
+
 bool Settings::run()
 {
     ESP_UTILS_LOGD("Run");
     Settings_ui_init();
+    labels_stop_scrolling(Settings_objects.main);
     syncSlidersFromCfg(Settings_objects.main);
+    s_ip_label = find_label_with_prefix(Settings_objects.main, IP_LABEL_PREFIX);
+    if (s_ip_label != nullptr) lv_obj_add_event_cb(s_ip_label, ip_label_deleted_cb, LV_EVENT_DELETE, nullptr);
+    batteryBindLabels(Settings_objects.main);
     return true;
 }
 
@@ -805,6 +1084,9 @@ void Settings::onStatusTimer(lv_timer_t *t)
     // Catches a BLE state change that arrived before the status bar existed.
     syncBluetoothIcon();
     refreshWifiIcon();
+    refreshIpLabel();
+    batteryTick();
+    refreshBatteryLabels();
 
     if (!s_pmu_inited) return;
 
@@ -849,7 +1131,14 @@ void Settings::refreshWifiIcon()
     using WifiState = systems::phone::StatusBar::WifiState;
     int state = -1;                                     // hidden: neither Wi-Fi nor ESP-NOW enabled
     if (cfg.wifi.enabled || cfg.espnow.enabled) {
-        state = static_cast<int>(isWifiConnected() ? WifiState::SIGNAL_3 : WifiState::DISCONNECTED);
+        // Standby, connecting and failed all show the "no Wi-Fi" glyph; bars
+        // only once connected, from the RSSI the Wi-Fi task samples.
+        WifiState ws = WifiState::DISCONNECTED;
+        if (isWifiConnected()) {
+            const int rssi = wifiRssi();
+            ws = (rssi >= -60) ? WifiState::SIGNAL_3 : (rssi >= -72) ? WifiState::SIGNAL_2 : WifiState::SIGNAL_1;
+        }
+        state = static_cast<int>(ws);
     }
     if (state == s_wifi_icon_state) return;
     if (bar->setWifiIconState(state)) s_wifi_icon_state = state;

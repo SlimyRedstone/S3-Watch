@@ -17,7 +17,7 @@ idf_component_register(
     INCLUDE_DIRS
         ${CMAKE_CURRENT_LIST_DIR}
         ${CMAKE_CURRENT_LIST_DIR}/ui
-    REQUIRES driver bsp_extra Settings
+    REQUIRES driver bsp_extra Settings json   # json: apps/sonometer.json (Options tab)
     WHOLE_ARCHIVE
 )
 

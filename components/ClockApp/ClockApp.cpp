@@ -315,8 +315,9 @@ void ClockApp::toggleAod()
 void ClockApp::enterLightSleep()
 {
     const auto &d = Settings::cfg.display;
-    ESP_UTILS_LOGI("Enter LIGHT SLEEP (dim=%d btn_wake=%d ble=%d)",
-                   (int)d.dim_screen, (int)d.user_button_wake_up, (int)Settings::bluetooth_running);
+    ESP_UTILS_LOGI("Enter LIGHT SLEEP (dim=%d btn_wake=%d ble=%d wifi=%d)",
+                   (int)d.dim_screen, (int)d.user_button_wake_up, (int)Settings::bluetooth_running,
+                   (int)Settings::wifi_running);
     _state = State::LIGHT_SLEEP;
 
     // Panel: dimmed to the configured level, or off. The SH8601 keeps the
@@ -349,11 +350,15 @@ void ClockApp::enterLightSleep()
     }
     uint32_t remain_ms = (deep_ms > already_idle) ? (deep_ms - already_idle) : 1000U;
 
+    // Battery statistics: gauge % at both ends = consumption while sleeping.
+    Settings::batterySleepBegin();
+
     bool timed_out;
-    if (Settings::bluetooth_running) {
+    if (Settings::bluetooth_running || Settings::wifi_running) {
         // The BLE controller does not survive a forced light sleep (no modem
-        // sleep configured, see sdkconfig). Keep the CPU up: the screen is
-        // already dimmed/off, wait for input or the deep-sleep deadline.
+        // sleep configured, see sdkconfig), and the Wi-Fi link would drop.
+        // Keep the CPU up: the screen is already dimmed/off, wait for input
+        // or the deep-sleep deadline.
         timed_out = !waitForInput(remain_ms);
     } else {
         esp_sleep_enable_timer_wakeup((uint64_t)remain_ms * 1000ULL);
@@ -364,6 +369,7 @@ void ClockApp::enterLightSleep()
         timed_out = (cause == ESP_SLEEP_WAKEUP_TIMER);
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     }
+    Settings::batterySleepEnd();
 
     if (timed_out) {
         // No user input for the whole deep-sleep delay -> escalate.
@@ -623,6 +629,10 @@ void ClockApp::enterDeepSleep()
 
     setBacklight(false);
 
+    // Battery statistics -> NVS, with the gauge % and time: deep sleep and
+    // power off are a reboot, the next boot measures what they used.
+    Settings::batteryCommit();
+
     // If something needs the RTC domain to stay alive across sleep (the
     // Podometer needs its ULP to keep counting), it owns the sleep. The PMU
     // shutdown below would cut the rail the ULP runs on.
@@ -814,8 +824,10 @@ void ClockApp::sleepMonitorTask(void *arg)
             continue;   // LVGL busy; check again next tick
         }
 
-        // Honour any active wake-lock (e.g. Flashlight in foreground).
-        if (Settings::sleep_locked) continue;
+        // Honour any active wake-lock (e.g. Flashlight in foreground), an app
+        // using Wi-Fi, and a firmware check / download / install: deep sleep
+        // would cut the transfer or the flash write.
+        if (Settings::sleep_locked || Settings::wifiInUse() || Settings::isFirmwareBusy()) continue;
 
         // Settings > Display (persisted on SD as /sdcard/.settings.json).
         const auto &d = Settings::cfg.display;
@@ -911,8 +923,11 @@ void ClockApp::onWakeTimer(lv_timer_t *t)
             }
             s_pmu.clearIrqStatus();
         }
+        // Not during a firmware download / install either (the AXP2101's own
+        // 4 s power-off still works if the watch is stuck).
         if (self->_pkey_press_us != 0 &&
-            (esp_timer_get_time() - self->_pkey_press_us) >= POWERKEY_LONG_PRESS_US && !Settings::sleep_locked) {
+            (esp_timer_get_time() - self->_pkey_press_us) >= POWERKEY_LONG_PRESS_US && !Settings::sleep_locked &&
+            !Settings::isFirmwareBusy()) {
             ESP_UTILS_LOGI("Power key long press -> deep sleep");
             self->_pkey_press_us = 0;
             self->enterDeepSleep();   // does not return

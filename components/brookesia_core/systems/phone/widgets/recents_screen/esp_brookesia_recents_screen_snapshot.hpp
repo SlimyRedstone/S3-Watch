@@ -69,10 +69,17 @@ public:
     bool updateByNewData(void);
 
 private:
+    // (S3-Watch) The app snapshot is a full-screen image shown at about 40 %: drawn with lv_image_set_scale(), LVGL's
+    // software transform resampled the whole snapshot on every frame (recents screen under 1 FPS). It is shrunk once
+    // into _scaled_snapshot instead, drawn 1:1. RGB565 only; other formats keep the scaled draw.
+    bool updateScaledSnapshot(const lv_image_dsc_t *src, int32_t w, int32_t h);
+    void freeScaledSnapshot(void);
+
     base::Context &_system_context;
     const Conf &_conf;
     const Data &_data;
 
+    lv_draw_buf_t *_scaled_snapshot = nullptr;
     int _origin_y = 0;
     ESP_Brookesia_LvObj_t _main_obj;
     ESP_Brookesia_LvObj_t _drag_obj;

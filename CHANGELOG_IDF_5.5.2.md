@@ -352,6 +352,160 @@ against the 72 KB the BLE start check asks for.
 - `SettingsUpgrade.cpp`: two error messages printed the full `.part` path (up to 199 chars) into a 128-byte buffer,
   rejected by `-Werror=format-truncation`; they print `.temp/<file name>` now.
 
+## Settings copy in flash, Wi-Fi station owned by Settings
+
+### Settings copy in flash (`Settings.cpp`)
+- Same JSON text as `/sdcard/.settings.json`, stored as NVS blob `settings`/`json` (existing `nvs` partition, no
+  partition change).
+- Boot (`ensureLoaded()`): SD file -> else flash copy -> else defaults, then `save()`.
+- SD file that is not valid JSON: renamed `.settings.bad.json` (kept for the user), flash copy used, SD file rewritten
+  from it. Before, a broken file was overwritten with defaults.
+- `save()` (was `saveToSd()`): one JSON text, SD rewritten only when it changes (hash), flash only when it differs
+  from the stored blob. SD write failure (card pulled out) still updates flash. `loadFromSd()` -> private
+  `loadFromText()`. Buffer 4 -> 8 KB.
+
+### Wi-Fi (`SettingsWifi.cpp`, new)
+- JSON: `settings.wifi.disabled_on_boot`, `settings.wifi.ssid` (array), `settings.wifi.pass` (array, `false` = open
+  network). Arrays of different lengths, more than 10 networks, an SSID not 1..32 chars or a pass not a string/false:
+  whole list rejected (`ESP_LOGE`, status FAILED with the reason), arrays saved back untouched.
+- One task `wifi_mgr` (4 KB internal stack, core 0) makes every `esp_wifi` call. Created on first need: Wi-Fi disabled
+  or on standby costs no RAM.
+- `enabled` false: nothing runs, `requestWifi()` returns false. `disabled_on_boot` false: connects at boot, stays
+  connected. `disabled_on_boot` true: radio off until `requestWifi()`, off again 30 s after the last `releaseWifi()`.
+- Pass: networks in order, next on disconnect event or no IP after 20 s. All failed: FAILED, radio off, until the next
+  request or switch toggle. Link lost later: one new pass.
+- Radio off = `esp_wifi_stop` + `esp_wifi_deinit` + netif destroyed: its internal RAM goes back to BLE.
+- Start check: 56 KB internal free / 16 KB block (estimate). Log `Radio on: internal RAM A -> B free` gives the real
+  cost.
+- Status-bar icon: "no Wi-Fi" glyph unless connected; bars from RSSI (>= -60 / -72 dBm), sampled every 10 s.
+- App API: `requestWifi()`, `waitWifi()`, `releaseWifi()`, `wifiStatus()`, `wifiStatusText()`, `wifiRssi()`.
+
+### Users
+- "Enable WiFi" switch -> `applyWifi()`.
+- Firmware update check: `requestWifi()`, worker waits for the connection, `releaseWifi()` at the end. Message box
+  shows `wifiStatusText()` on failure. Old `isWifiConnected()` (esp_netif lookup) replaced by the status.
+- `ClockApp`: no forced light sleep while the radio is on (as with BLE); no sleep at all while an app holds a Wi-Fi
+  request (download).
+
+### Device name, Wi-Fi menu rows, no sleep during firmware work
+- `settings.device.name` (max 31 bytes, cut on a UTF-8 boundary; default "S3 Watch"). A top-level `device.name` is
+  read too, then saved under `settings`.
+  - BLE: GAP name (`ble_mouse_init(cfg.device.name)`). Advertisement has 15 bytes left for the name: longer names go
+    shortened there and complete in the scan response (29 bytes). Before, `ble_gap_adv_set_fields()` failed silently
+    with names over 15 bytes.
+  - Wi-Fi: DHCP hostname (router client list), set before each radio start. Hostname rules: letters, digits, '-';
+    "SlimyRedstone's Watch" -> `SlimyRedstones-Watch`.
+- `get/set_wifi_disable_on_boot_value()` ("Disable WiFi on boot" switch): off -> connect now (if Wi-Fi enabled),
+  on -> standby, radio off 30 s after the last app releases it.
+- `get_wifi_ip_address()`: "IP Address: 192.168.1.20", "IP Address: connecting..." or "IP Address: not connected".
+  The status timer rewrites the row while the menu is open (label found by its prefix, pointer cleared on delete).
+- `Settings::isFirmwareBusy()`: true for the whole update worker (Wi-Fi wait, check, download, future install).
+  ClockApp: no light/deep sleep and no power-key deep sleep meanwhile (AXP2101 4 s hard power-off unchanged).
+
+### Wi-Fi start `ESP_ERR_NO_MEM` (fix)
+Log: `Init static rx buffer size: 2212`, `malloc buffer fail`, `Expected to init 10 rx buffer, actual is 5`, with
+61 KB internal free (BLE up). The Wi-Fi MAC only DMAs from internal SRAM: static TX/RX buffers are internal whatever
+`SPIRAM_TRY_ALLOCATE_WIFI_LWIP` says (`zalloc_internal_wrapper`, esp32s3/esp_adapter.c).
+- `CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM` 16 -> 8 (~13 KB), `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM` 10 -> 6 (~9 KB,
+  still >= `RX_BA_WIN` 6), `CONFIG_ESP_WIFI_CSI_ENABLED` off (unused, ~1 KB per RX buffer). sdkconfig (both names) +
+  sdkconfig.defaults.
+- The `wifi_init: Failed to deinit Wi-Fi driver (0x3001)` lines are IDF's own clean-up inside the failed
+  `esp_wifi_init()`, not an extra error.
+- `ESP_ERR_NO_MEM` now shows "Not enough memory to start Wi-Fi (N KB free). Turn Bluetooth off and try again."
+
+### BLE Mouse: no left/right swipe, wider scroll strip
+- Brookesia `phone::App::Config::flags.disable_navigation_gesture_back` (new, default 0) + protected
+  `disableNavigationGestureBack()`; `Manager::processGestureScreenChange()` then turns the left/right "back" swipe and
+  its edge mask/indicator off for that app only. Bottom-edge swipe (home / recents) unchanged.
+- BLEMouse: calls it in its constructor; its own edge-drag "back" in `onPadRelease()` removed.
+- Scroll strip `SCROLL_STRIP_PX` 48 -> 58 (+20 %): drawn strip and touch zone.
+
+### Sonometer: Options tab saved to `/sdcard/apps/sonometer.json`
+- `{"fft": {"bars", "min_db", "max_db", "hide_peaks", "peaks"}}` = `n_bars_selector`, `fft_min_sens_slider`,
+  `fft_max_sens_slider`, `fft_options_peaks_disabled_switch`, `fft_peaks_n_selector`.
+- `run()`: file -> widgets (`params_setup()`) right after `Sonometer_ui_init()`, before `sound_graph_setup()` /
+  `fft_options_setup()`, which read the widgets as before. Read on every opening: a file edited on a PC applies at the
+  next one. Number not in a dropdown -> nearest option (warning); slider value clamped to its range; file rewritten
+  with what is shown. Missing file/key: UI initial values, file written. Not JSON: renamed `sonometer.bad.json`.
+- Changes (bar/peak selectors, peaks switch, both sliders) saved 1 s after the last one (`lv_timer`), and on `close()`.
+- No SD card: values kept in RAM until restart. An unsaved change is not overwritten by the older file.
+- Sonometer CMake: `REQUIRES ... json`.
+
+### Sonometer: new Options UI (range slider, peaks grid)
+- `fft_min_sens_slider` + `fft_max_sens_slider` -> `fft_sens_slider` (range mode, 0..90 dB in the UI): left knob =
+  bottom of `fft_graph`, right knob = top. Label `fft_sens_value_label` through EEZ variable `fft_sensitivity_value`:
+  "16dB to 54dB" (`get/set_var_fft_min|max_sensitivity_value` -> `get/set_var_fft_sensitivity_value`).
+- `range_slider_set()`: LVGL 9.2 clamps the left knob to the right one and the right knob to the left one on every
+  call, so the knob set first depends on the direction. Used for `apps/sonometer.json` (`min_db` / `max_db`, swapped
+  if reversed). An older file with `min_db` below the new slider range (old default -48) is clamped to 0 and rewritten.
+- `fft_peaks_list` as a 3-column grid (`FFT_PEAKS_GRID_COLS`), filled left to right then top to bottom: 3 x 4 for 10
+  peaks. The EEZ export sets grid track *sizes* `{4}` / `{3}` (one 4 px row, one 3 px column in LVGL), replaced in
+  `fft_peaks_grid_setup()` by 3 `LV_GRID_FR(1)` columns and one `LV_GRID_CONTENT` row per line. Cell padding 2 / 4 px
+  (`FFT_PEAKS_CELL_PAD_VER/HOR`) so 4 rows fit the 100 px list.
+- Cell text `"#%02u: %0.0fHz (%0.1fdB)"`, #01 = strongest; empty cell `"#04: -"`.
+
+### Sonometer: readable peak cells, peak bars in colour
+- Index removed: cell text back to `"%0.0fHz (%0.1fdB)"`, empty cell `"-"`.
+- A scrolling label (list button default, `LV_LABEL_LONG_SCROLL_CIRCULAR`) restarts its scroll on every
+  `lv_label_set_text()`, 4 times a second here: labels now `LV_LABEL_LONG_CLIP`. Wider cells so the text fits: list
+  side padding 16 -> 4 px (`FFT_PEAKS_LIST_PAD_HOR`), cell side padding 4 -> 2 px: about 112 px per cell, against
+  111 px for "1234Hz (56.7dB)" in Montserrat 14 (126 px for a 5-digit frequency: its end is clipped).
+- Colours: cell i of n gets hue `FFT_PEAKS_HUE_FIRST` (0, red) + i * (240 - 0) / (n - 1) up to `FFT_PEAKS_HUE_LAST`
+  (240, blue), saturation 70 % (pure blue is hard to read on the dark list), value 100 %. Text in that colour.
+- Bars: each listed peak's bar (the bar holding the peak's bin centre, then its pixel column(s) as `fft_render` lays
+  them out) is drawn in its cell's colour by `fft_draw_cb`: one opaque rectangle from the bar's current top
+  (`s_fft_top`) to the bottom, over the white image. At most 10 rect draw tasks, no RGB plane rewrite in PSRAM.
+  Updated with the list (every 250 ms); only changed columns are invalidated. Cleared when the peaks are hidden, the
+  bar count or the peak count changes.
+
+### Performance: Settings at rest, recents screen
+- Settings 50-60 % "CPU" with nothing touched: every menu row label is `LV_LABEL_LONG_SCROLL_CIRCULAR`
+  (`ui/screens.c` `create_text()`). The menu has a sidebar (`lv_menu_set_sidebar_page`), so both columns are narrow
+  and long titles ("Disable sleep when charging", ...) overflow: each one scrolls for ever, its area re-rendered and
+  flushed every 16 ms. `Settings::run()` now switches those labels to `LV_LABEL_LONG_WRAP` (`labels_stop_scrolling()`,
+  ui/ untouched): long titles take 2 lines, nothing animates. (The perf monitor's CPU % is the LVGL task's busy time,
+  flush DMA waits included.)
+- Recents screen (swipe up from the bottom) under 1 FPS / 95 %: each app snapshot is the full 410x502 RGB565 screen
+  shown at 40 % with `lv_image_set_scale()`; LVGL's software transform resampled it on every frame, for every visible
+  app. Brookesia `RecentsScreenSnapshot` now shrinks it once per opening (box filter, `updateScaledSnapshot()`) into
+  its own 163x200 draw buffer, drawn 1:1 (plain blit). Freed with the snapshot widget; formats other than RGB565 keep
+  the scaled draw. The rounded corners (`clip_corner`, radius 20) stay: LVGL 9.2 only layers the 4 corner strips.
+- Left as is: the snapshot itself (`lv_snapshot_take_to_draw_buf`, one off-screen render of the app when the recents
+  screen opens) is a one-time hitch, not a per-frame cost.
+
+### Settings menu fonts
+- `ui/screens.c`: the screen and menu fonts used `LV_PART_MAIN | LV_PART_ITEMS` = `LV_PART_ITEMS` (`LV_PART_MAIN` is
+  0, parts are values): labels inherit from `LV_PART_MAIN` only, so they always showed the theme font (Montserrat 14).
+  Now `LV_PART_MAIN`: page contents 18 (menu font, inherited; the "Check for updates" button too), sidebar categories
+  and "Settings" title (sidebar header) 16.
+- Sidebar 30 % -> 39 % (159 px): "Developer" at 16 px + icon + paddings is 155 px, it wrapped before even at 14 px.
+- Montserrat 8/10/12/16/20 were added to `sdkconfig.defaults` only; the existing `sdkconfig` had them as "is not set",
+  which wins over the defaults (`lv_font_montserrat_16` would not exist). Enabled in `sdkconfig` too.
+- Side effect: `half_size_font()` (battery percentage at half the clock size) now also picks among 8/10/12/16/20.
+
+### Settings horizontal separator
+- `create_h_separator()`: the line is 75 % of the parent's width, centred (12.5 % free on each side). The section is
+  a flex column: `lv_obj_set_pos()` was ignored and margins take pixels only. The line now sits in a full-width
+  transparent row (`lv_obj_remove_style_all`, not clickable/scrollable) and is aligned `TOP_MID` inside it.
+- The end point is `LV_PCT(100)` (resolved by `lv_line` against its own width) instead of a fixed 410 px.
+
+### Settings > Battery rows (`SettingsBattery.cpp`, new)
+- Getters for the 6 rows (status, USB connected, battery voltage, USB voltage, est. life, est. life while sleeping;
+  prototypes in `settings_ui_bridge.h`), rows found by prefix after each menu build and rewritten by the status timer
+  (1.5 s) when the text changes. One PMU read shared by the getters (500 ms cache).
+- Current and temperature rows removed (with their getters, the charging-session rate and the die-temperature read).
+- The AXP2101 has no current measurement (no current ADC, no coulomb counter): the life rows use the mean current
+  from the fuel gauge, % lost over time x 400 mAh (`BATTERY_CAPACITY_MAH`). 1 % = 4 mAh. "measuring..." until 5 min
+  (awake) / 1 h (asleep) and 2 % steps were seen. On battery only.
+- Awake / sleep rates kept apart, with exponential forgetting (2 h awake, 48 h asleep):
+  - awake: gauge read every 10 s (status timer);
+  - light sleep and its BLE/Wi-Fi stand-in: `batterySleepBegin()` / `batterySleepEnd()` in `ClockApp::enterLightSleep()`;
+  - deep sleep / power off: `batteryCommit()` at the top of `ClockApp::enterDeepSleep()` saves the stats plus gauge %
+    and wall-clock time to NVS (`settings`/`bat_stats`); the next boot counts the drop once the RTC sync set the clock.
+- Saved every 15 min while awake too. No ULP: it could only re-read the same gauge %.
+- Sleep life shows "> 12d04h" (lower bound) when fewer than 2 % were lost after 6 h of sleep.
+- `pmu_open()`: VBUS voltage ADC channel enabled.
+
 ## 5. What to do now
 
 1. `idf.py build` (full build, link untested by me).

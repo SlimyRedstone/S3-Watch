@@ -197,23 +197,52 @@ static int gap_event(struct ble_gap_event *event, void *)
     }
 }
 
+// Advertising packet: 31 bytes. Flags (3) + TX power (3) + HID UUID (4) +
+// appearance (4) leave 15 bytes of name (2-byte field header). A longer
+// device name (Settings: device.name) goes shortened in the advertisement and
+// complete in the scan response (29 bytes); hosts list the scan-response
+// name. Before, a long name made ble_gap_adv_set_fields() fail silently.
+static constexpr size_t ADV_NAME_ROOM = 31 - 3 - 3 - 4 - 4 - 2;
+static constexpr size_t RSP_NAME_ROOM = 31 - 2;
+
+// Length of s cut to max bytes without splitting a UTF-8 character.
+static size_t utf8_cut(const char *s, size_t max)
+{
+    size_t n = strlen(s);
+    if (n <= max) return n;
+    n = max;
+    while (n > 0 && ((uint8_t)s[n] & 0xC0) == 0x80) n--;
+    return n;
+}
+
 static void start_advertising(void)
 {
     struct ble_hs_adv_fields fields = {};
     const char *name = ble_svc_gap_device_name();
+    const size_t name_len = strlen(name);
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
     fields.name = (uint8_t *)name;
-    fields.name_len = strlen(name);
-    fields.name_is_complete = 1;
+    fields.name_len = (uint8_t)utf8_cut(name, ADV_NAME_ROOM);
+    fields.name_is_complete = (fields.name_len == name_len);
     static const ble_uuid16_t adv_uuid = BLE_UUID16_INIT(0x1812);
     fields.uuids16 = (ble_uuid16_t *)&adv_uuid;
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
     fields.appearance = 0x03C2;
     fields.appearance_is_present = 1;
-    ble_gap_adv_set_fields(&fields);
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) ESP_UTILS_LOGW("Advertising data rejected (rc=%d)", rc);
+
+    struct ble_hs_adv_fields rsp = {};                // empty when the name fits above
+    if (!fields.name_is_complete) {
+        rsp.name = (uint8_t *)name;
+        rsp.name_len = (uint8_t)utf8_cut(name, RSP_NAME_ROOM);
+        rsp.name_is_complete = (rsp.name_len == name_len);
+    }
+    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc != 0) ESP_UTILS_LOGW("Scan response rejected (rc=%d)", rc);
 
     struct ble_gap_adv_params adv_params = {};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
@@ -297,7 +326,8 @@ static bool ble_set_enabled(bool enable)
             return false;
         }
         s_ble_free_before = free_b;
-        if (ble_mouse_init("S3 Watch") != ESP_OK) {
+        // Settings: device.name (<= 31 bytes = CONFIG_BT_NIMBLE_GAP_DEVICE_NAME_MAX_LEN)
+        if (ble_mouse_init(Settings::cfg.device.name) != ESP_OK) {
             ESP_UTILS_LOGE("Bluetooth init failed");
             return false;
         }
@@ -414,7 +444,12 @@ BLEMouse *BLEMouse::requestInstance(bool use_status_bar, bool use_navigation_bar
 
 BLEMouse::BLEMouse(bool use_status_bar, bool use_navigation_bar)
     : App(APP_NAME, &trackpad_icon,
-          true, use_status_bar, use_navigation_bar) {}
+          true, use_status_bar, use_navigation_bar)
+{
+    // Horizontal drags from the pad edges are cursor moves, not "back". The
+    // bottom-edge swipe (home / recents) still leaves the app.
+    disableNavigationGestureBack();
+}
 
 BLEMouse::~BLEMouse() { _instance = nullptr; }
 
@@ -521,7 +556,9 @@ bool BLEMouse::close()
 //   1 finger drag        -> cursor move
 //   quick tap (1 finger) -> left click      (< TAP_MAX_US, < TAP_MAX_MOVE_PX)
 //   2 finger drag        -> wheel scroll    (slide down = scroll down)
-//   edge drag            -> back to launcher (unchanged)
+//   right-strip drag     -> wheel scroll
+// No left/right edge "back" swipe (Brookesia's is off for this app, see the
+// constructor); leave with the bottom-edge swipe.
 //
 // LVGL only ever reports one pointer (the touch driver's first point), so the
 // second finger is detected by reading the FT5x06 touch-count register
@@ -548,9 +585,7 @@ void BLEMouse::onPadPress(lv_event_t *e)
         self->_two_finger = (read_touch(&my) >= 2);
         if (self->_two_finger) self->_scroll_last_y = my;
     }
-    // Mark as candidate "back" gesture if press starts within 30 px of left/right edge.
     int w = lv_obj_get_width(self->_pad);
-    self->_edge_swipe  = (p.x < 30) || (p.x > w - 30);
     // Press in the right-edge strip = one-finger scroll gesture.
     self->_strip_scroll = (p.x >= w - SCROLL_STRIP_PX);
     self->_strip_last_y = p.y;
@@ -671,20 +706,6 @@ void BLEMouse::onPadRelease(lv_event_t *e)
         send_mouse_report(0x00, 0, 0);
     }
 
-    // Per-app "back" gesture: edge-start drag, only when BLE is connected.
-    // Lower threshold than the global gesture (15 px instead of 30).
-    // A tap cannot also be a back swipe: it moved less than TAP_MAX_MOVE_PX.
-    if (!tap && !self->_two_finger && self->_edge_swipe && s_connected) {
-        lv_indev_t *ind = lv_indev_active();
-        if (ind) {
-            lv_point_t p; lv_indev_get_point(ind, &p);
-            int dx = p.x - self->_start_point.x;
-            if (dx > 15 || dx < -15) {
-                self->notifyCoreClosed();
-            }
-        }
-    }
-    self->_edge_swipe   = false;
     self->_two_finger   = false;
     self->_strip_scroll = false;
 }

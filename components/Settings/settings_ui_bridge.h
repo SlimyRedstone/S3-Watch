@@ -30,6 +30,19 @@ void set_battery_perc_text_value(bool value);
 bool get_developer_performance_value(void);
 void set_developer_performance_value(bool value);
 
+// WiFi > "Disable WiFi on boot" and the IP address row (also missing from actions.h)
+bool get_wifi_disable_on_boot_value(void);
+void set_wifi_disable_on_boot_value(bool value);
+const char *get_wifi_ip_address(void);           // "IP Address: 192.168.1.20"
+
+// Battery rows (SettingsBattery.cpp). Static buffers, kept current by the status timer.
+const char *get_battery_charge_status_label(void);        // "Status: CHARGING"
+const char *get_battery_usb_status_label(void);           // "USB connected: true"
+const char *get_battery_voltage_label(void);              // "Voltage: 4123mV"
+const char *get_battery_ac_voltage_label(void);           // "USB voltage: 5120mV"
+const char *get_battery_estimated_life_label(void);       // "Est. life: 1h35"
+const char *get_battery_estimated_sleep_life_label(void); // "Est. life, while sleeping: 5h45"
+
 #ifdef __cplusplus
 }
 #endif

@@ -67,3 +67,9 @@ CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # NimBLE host logs every GATT notify at INFO (two lines per HID report). Warnings and errors only.
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+# Wi-Fi DMA buffers live in internal SRAM (the Wi-Fi MAC cannot DMA from PSRAM). With BLE up, 16 TX + 10 RX + CSI
+# did not fit (esp_wifi_init: "Expected to init 10 rx buffer, actual is 5", ESP_ERR_NO_MEM at 61 KB free).
+# 8 TX (~13 KB) + 6 RX (~13 KB, >= RX_BA_WIN 6) is plenty for HTTP; CSI is unused (~1 KB per RX buffer).
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+# CONFIG_ESP_WIFI_CSI_ENABLED is not set

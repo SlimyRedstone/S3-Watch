@@ -22,7 +22,7 @@ public:
     // of the pad scrolls instead of moving the cursor. Works even if the touch
     // controller only reports one finger (FT3168 is self-capacitive; its 2-point
     // mode is a firmware option, see read_touch()).
-    static constexpr int        SCROLL_STRIP_PX   = 48;
+    static constexpr int        SCROLL_STRIP_PX   = 58;         // was 48 (+20 %)
 
     static BLEMouse *requestInstance(
         bool use_status_bar = true, bool use_navigation_bar = false);
@@ -58,7 +58,6 @@ private:
     lv_point_t _last_point   = {};
     lv_point_t _start_point  = {};
     bool       _has_last     = false;
-    bool       _edge_swipe   = false;   // candidate for back-to-launcher gesture
 
     // Gesture classification for the current press.
     int64_t    _press_us     = 0;       // esp_timer time at LV_EVENT_PRESSED

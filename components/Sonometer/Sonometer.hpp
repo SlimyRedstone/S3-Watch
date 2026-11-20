@@ -62,7 +62,8 @@ static_assert(SOUND_UPDATE_RATE_HZ > 0 && SOUND_UPDATE_RATE_HZ <= 1000, "SOUND_U
       draw task per bar per refresh stripe (3-4 fps at 128+ bars)
 @note Levels in dB SPL per bin, with the level's calibration: a pure tone reads about 1.8 dB below its level on a 1-bin bar,
       lower on bars averaging many bins
-@note dB range = fft_min_sens_slider .. fft_max_sens_slider (Options tab, action fft_options_slider_changed)
+@note dB range = fft_sens_slider (range mode): left knob .. right knob, shown as "16dB to 54dB" in fft_sens_value_label
+      (EEZ variable fft_sensitivity_value; Options tab, action fft_options_slider_changed)
 @note fft_frequency_scale sections are drawn as bands over the plot (their main style's line colour and opacity):
       LVGL 9.2.2 draws horizontal scale sections at uninitialised x positions, so the scale's own section line is hidden
 */
@@ -72,8 +73,8 @@ static_assert(SOUND_UPDATE_RATE_HZ > 0 && SOUND_UPDATE_RATE_HZ <= 1000, "SOUND_U
                                                         // was 20 (50/s): more redraws than the LVGL core can render, see fft_render()
 #define FFT_GRAPH_COLOR_HEX         0xFFFFFF
 #define FFT_GRAPH_GAP_FROM_PX       4                   // bars at least this wide get a 1 px gap on their right
-#define FFT_GRAPH_DB_MIN            0                   // dB SPL per bin, bottom of the chart, when the UI has no fft_min_sens_slider
-#define FFT_GRAPH_DB_MAX            100                 // dB SPL per bin, top of the chart, when the UI has no fft_max_sens_slider
+#define FFT_GRAPH_DB_MIN            0                   // dB SPL per bin, bottom of the chart, when the UI has no fft_sens_slider
+#define FFT_GRAPH_DB_MAX            100                 // dB SPL per bin, top of the chart, when the UI has no fft_sens_slider
 #define FFT_GRAPH_F_MIN             20                  // Hz, left end, when the UI has no fft_frequency_scale
 #define FFT_GRAPH_F_MAX             20000               // Hz, right end, when the UI has no fft_frequency_scale
 #define FFT_GRAPH_BARS_DEFAULT      32                  // when the UI has no n_bars_selector
@@ -84,13 +85,43 @@ static_assert(FFT_SIZE >= 256 && (FFT_SIZE & (FFT_SIZE - 1)) == 0, "FFT_SIZE mus
 
 /*
 @brief FFT peaks (Sonometer_objects.fft_peaks_list): strongest local maxima of the spectrum, "%0.0fHz (%0.1fdB)", strongest first
-@note Row count from fft_peaks_n_selector, hidden with fft_options_peaks_disabled_switch (EEZ variable fft_peaks_list_disabled)
+@note Shown as a grid, FFT_PEAKS_GRID_COLS columns filled left to right then top to bottom (3 x 4 for 10 peaks)
+@note Each cell has its colour, hue FFT_PEAKS_HUE_FIRST (red, strongest) to FFT_PEAKS_HUE_LAST (blue, last cell), and the
+      bar showing that peak in fft_graph is drawn in the same colour (fft_draw_cb, over the white bars)
+@note Labels clip (no scrolling): the text changes every FFT_PEAKS_UPDATE_PERIOD_MS, a scrolling label restarted each time.
+      Cells are about 112 px wide: "1234Hz (56.7dB)" fits in Montserrat 14 (111 px), a 5-digit frequency loses its end
+@note Cell count from fft_peaks_n_selector, hidden with fft_options_peaks_disabled_switch (EEZ variable fft_peaks_list_disabled)
 @note Searched in the bins (5.86 Hz @ 8192) within the fft_frequency_scale range, interpolated between bins
 @note Level = dB SPL of a pure tone at that frequency (window's coherent gain), a tone reads its level (1.8 dB above a 1-bin bar)
 */
 #define FFT_PEAKS_MAX               16                  // rows kept at most
 #define FFT_PEAKS_DEFAULT           3                   // when the UI has no fft_peaks_n_selector
 #define FFT_PEAKS_UPDATE_PERIOD_MS  250                 // list refresh, slower than the bars so the values stay readable
+#define FFT_PEAKS_GRID_COLS         3                   // grid columns of fft_peaks_list
+#define FFT_PEAKS_LIST_PAD_HOR      4                   // px, list side padding (theme: 16 px), for wider cells
+#define FFT_PEAKS_CELL_PAD_VER      2                   // px, cell padding: 4 rows fit the 100 px list with Montserrat 14
+#define FFT_PEAKS_CELL_PAD_HOR      2
+#define FFT_PEAKS_HUE_FIRST         0                   // degrees, first cell (strongest peak): red
+#define FFT_PEAKS_HUE_LAST          240                 // degrees, last cell: blue; hue increases cell by cell
+#define FFT_PEAKS_COLOR_SAT         70                  // %, < 100 so the blue end stays readable on the dark list
+#define FFT_PEAKS_COLOR_VAL         100                 // %
+
+/*
+@brief Options tab saved on the SD card (BSP_SD_MOUNT_POINT "/" SONOMETER_PARAMS_FILE):
+       {"fft": {"bars": 16, "min_db": 16, "max_db": 75, "hide_peaks": false, "peaks": 3}}
+@note bars / peaks = n_bars_selector / fft_peaks_n_selector option, min_db / max_db = fft_sens_slider
+      left / right knob (swapped if min_db > max_db), hide_peaks = fft_options_peaks_disabled_switch
+@note Read on every opening (a file edited on a PC applies at the next one). A number that is not a dropdown option takes
+      the nearest option, a slider value is clamped to the slider range; the file is then rewritten with what is shown
+@note Missing file or key: the UI's initial values, and the file is (re)written. File that is not JSON: renamed
+      SONOMETER_PARAMS_BAD_FILE, then rewritten
+@note Saved SONOMETER_PARAMS_SAVE_DELAY_MS after the last change (slider drags fire on every pixel), and when the app closes
+@note No SD card: the values are kept in RAM until the watch restarts
+*/
+#define SONOMETER_PARAMS_FILE           "apps/sonometer.json"
+#define SONOMETER_PARAMS_BAD_FILE       "apps/sonometer.bad.json"
+#define SONOMETER_PARAMS_SAVE_DELAY_MS  1000
+#define SONOMETER_PARAMS_FILE_MAX       1024
 
 /*
 @brief EEZ variables refresh (Sonometer_ui_tick), same period as the original display loop

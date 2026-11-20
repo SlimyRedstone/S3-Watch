@@ -2,8 +2,9 @@
  * Settings > Upgrade: firmware update check and download.
  *
  * "Check for updates" (BUTTON_CHECK_UPDATES) -> Settings::checkForUpdates():
- *   1. Wi-Fi must be connected (station with an IP), else the user is asked
- *      to enable Wi-Fi and connect to a router.
+ *   1. Wi-Fi: requestWifi() (Settings connects to the saved networks, see
+ *      SettingsWifi.cpp), then wait for the connection. Wi-Fi disabled or no
+ *      usable network saved: the user is told why, nothing else happens.
  *   2. GET cfg.upgrade.src_url, expected answer:
  *        {"last":{"t":"v1.2.0","n":[1,2,0]}, "url":"https://.../v1.2.0.bin"}
  *   3. Installed version (Settings::getVersion()) >= latest: "up to date".
@@ -30,7 +31,6 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
-#include "esp_netif.h"
 #include "esp_pthread.h"
 #include "esp_timer.h"
 
@@ -52,7 +52,10 @@ constexpr uint32_t WORKER_STACK      = 12 * 1024;     // TLS handshake + cJSON +
 constexpr int64_t  PROGRESS_EVERY_US = 500 * 1000;    // message box refresh while downloading
 constexpr const char *TEMP_DIR       = BSP_SD_MOUNT_POINT "/.temp";
 
-std::atomic<bool> s_busy{false};                      // one check/download at a time
+// One check/download at a time. True for the whole worker (Wi-Fi wait, check,
+// download, and the install step once it exists): ClockApp does not sleep
+// meanwhile (Settings::isFirmwareBusy()).
+std::atomic<bool> s_busy{false};
 
 // ---------------------------------------------------------------------------
 // Message box (one at a time). All access under the LVGL lock.
@@ -296,6 +299,13 @@ void run_update_check(void)
     char text[320];
     Settings::UpdateInfo info = {};
 
+    if (!Settings::isWifiConnected()) {
+        ui_message("Firmware update", "Connecting to Wi-Fi...");
+        if (!Settings::waitWifi()) {
+            ui_message("Wi-Fi not connected", Settings::wifiStatusText());
+            return;
+        }
+    }
     ui_message("Firmware update", "Checking for updates...");
     if (!Settings::fetchLatestVersion(info, err, sizeof(err))) {
         ui_message("Update check failed", err);
@@ -333,6 +343,7 @@ void run_update_check(void)
 void *update_worker(void *)
 {
     run_update_check();
+    Settings::releaseWifi();                          // the request made by checkForUpdates()
     s_busy = false;
     return nullptr;
 }
@@ -343,6 +354,11 @@ void *update_worker(void *)
 // Public API
 // ---------------------------------------------------------------------------
 
+bool Settings::isFirmwareBusy()
+{
+    return s_busy.load();
+}
+
 const char *Settings::getVersionText()
 {
     static char text[32] = {0};                       // "v65535.65535.65535" fits
@@ -351,18 +367,6 @@ const char *Settings::getVersionText()
                  (unsigned)FW_VERSION.patch_num);
     }
     return text;
-}
-
-bool Settings::isWifiConnected()
-{
-    // No network interface at all means esp_netif was never initialised: the
-    // handle lookup below goes through the lwIP thread and must not be called.
-    if (esp_netif_get_nr_of_ifs() == 0) return false;
-    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta == nullptr || !esp_netif_is_netif_up(sta)) return false;
-    esp_netif_ip_info_t ip = {};
-    if (esp_netif_get_ip_info(sta, &ip) != ESP_OK) return false;
-    return ip.ip.addr != 0;
 }
 
 bool Settings::fetchLatestVersion(UpdateInfo &out, char *err, size_t err_len)
@@ -454,12 +458,10 @@ void Settings::checkForUpdates()
         ESP_UTILS_LOGW("Update check already running");
         return;
     }
-    if (!isWifiConnected()) {
+    // Settings connects (or is already connected); the worker waits for it.
+    if (!requestWifi()) {
         s_busy = false;
-        ui_message("Wi-Fi required",
-                   cfg.wifi.enabled
-                       ? "Wi-Fi is not connected.\nConnect the watch to a Wi-Fi router, then check again."
-                       : "Wi-Fi is off.\nEnable it in Settings > WiFi and connect to a Wi-Fi router, then check again.");
+        ui_message("Wi-Fi required", wifiStatusText());   // off, no network saved, or list invalid
         return;
     }
 
@@ -477,6 +479,7 @@ void Settings::checkForUpdates()
     esp_pthread_set_cfg(&def);                        // the LVGL task's later pthreads get defaults again
 
     if (rc != 0) {
+        releaseWifi();
         s_busy = false;
         ui_message("Update check failed", "Could not start the update task (memory).");
         return;

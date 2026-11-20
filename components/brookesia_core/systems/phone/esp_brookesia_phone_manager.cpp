@@ -345,13 +345,16 @@ bool Manager::processGestureScreenChange(Screen screen, void *param)
         navigation_bar_visual_mode = app_data->navigation_bar_visual_mode;
         _flags.enable_gesture_navigation = (app_data->flags.enable_navigation_gesture &&
                                             (navigation_bar_visual_mode != NavigationBar::VisualMode::SHOW_FIXED));
+        // S3-Watch: an app can drop the left/right "back" swipe alone (BLE trackpad); no edge mask / indicator then.
         _flags.enable_gesture_navigation_back = (_flags.enable_gesture_navigation &&
-                                                data.flags.enable_gesture_navigation_back);
+                                                data.flags.enable_gesture_navigation_back &&
+                                                !app_data->flags.disable_navigation_gesture_back);
         _flags.enable_gesture_navigation_home = (_flags.enable_gesture_navigation &&
                                                 (navigation_bar_visual_mode == NavigationBar::VisualMode::HIDE));
         _flags.enable_gesture_navigation_recents_app = _flags.enable_gesture_navigation_home;
-        _flags.enable_gesture_show_mask_left_right_edge = (_flags.enable_gesture_navigation ||
-                (navigation_bar_visual_mode == NavigationBar::VisualMode::SHOW_FLEX));
+        _flags.enable_gesture_show_mask_left_right_edge =
+            ((_flags.enable_gesture_navigation && !app_data->flags.disable_navigation_gesture_back) ||
+             (navigation_bar_visual_mode == NavigationBar::VisualMode::SHOW_FLEX));
         _flags.enable_gesture_show_mask_bottom_edge = (_flags.enable_gesture_navigation ||
                 (navigation_bar_visual_mode == NavigationBar::VisualMode::SHOW_FLEX));
         _flags.enable_gesture_show_left_right_indicator_bar = _flags.enable_gesture_show_mask_left_right_edge;

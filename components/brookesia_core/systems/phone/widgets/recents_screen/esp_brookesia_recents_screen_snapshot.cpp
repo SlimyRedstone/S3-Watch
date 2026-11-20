@@ -3,6 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <algorithm>
 #include "esp_brookesia_systems_internal.h"
 #if !ESP_BROOKESIA_PHONE_RECENTS_SCREEN_ENABLE_DEBUG_LOG
 #   define ESP_BROOKESIA_UTILS_DISABLE_DEBUG_LOG
@@ -138,6 +139,7 @@ bool RecentsScreenSnapshot::del(void)
     _title_label.reset();
     _snapshot_obj.reset();
     _snapshot_image.reset();
+    freeScaledSnapshot();                       // after the image object that showed it
 
     return true;
 }
@@ -186,24 +188,96 @@ bool RecentsScreenSnapshot::updateByNewData(void)
     lv_obj_set_size(_snapshot_obj.get(), _data.image.main_size.width, _data.image.main_size.height);
     lv_obj_set_style_radius(_snapshot_obj.get(), _data.image.radius, 0);
     // Snapshot image
+    const void *image_src = _conf.snapshot_image_resource;
     if (_conf.snapshot_image_resource != _conf.icon_image_resource) {
-        h_factor = (float)(_data.image.main_size.height) / ((const lv_img_dsc_t *)_conf.snapshot_image_resource)->header.h;
-        w_factor = (float)(_data.image.main_size.width) / ((const lv_img_dsc_t *)_conf.snapshot_image_resource)->header.w;
+        const lv_img_dsc_t *snapshot = (const lv_img_dsc_t *)_conf.snapshot_image_resource;
+        h_factor = (float)(_data.image.main_size.height) / snapshot->header.h;
+        w_factor = (float)(_data.image.main_size.width) / snapshot->header.w;
         if (h_factor < w_factor) {
             app_img_zoom = (int)(h_factor * LV_SCALE_NONE);
         } else {
             app_img_zoom = (int)(w_factor * LV_SCALE_NONE);
         }
-        lv_image_set_scale(_snapshot_image.get(), app_img_zoom);
+        // S3-Watch: same size on screen, shrunk once here instead of on every frame
+        const int32_t w = std::max<int32_t>((int32_t)snapshot->header.w * app_img_zoom / LV_SCALE_NONE, 1);
+        const int32_t h = std::max<int32_t>((int32_t)snapshot->header.h * app_img_zoom / LV_SCALE_NONE, 1);
+        if ((app_img_zoom < LV_SCALE_NONE) && updateScaledSnapshot(snapshot, w, h)) {
+            image_src = _scaled_snapshot;
+            lv_image_set_scale(_snapshot_image.get(), LV_SCALE_NONE);
+        } else {
+            freeScaledSnapshot();
+            lv_image_set_scale(_snapshot_image.get(), app_img_zoom);
+        }
         lv_obj_align(_snapshot_image.get(), LV_ALIGN_TOP_MID, 0, 0);
     } else {
+        freeScaledSnapshot();
         lv_image_set_scale(_snapshot_image.get(), LV_SCALE_NONE);
         lv_obj_center(_snapshot_image.get());
     }
     lv_obj_set_size(_snapshot_image.get(), _data.image.main_size.width, _data.image.main_size.height);
-    lv_img_set_src(_snapshot_image.get(), _conf.snapshot_image_resource);
+    lv_img_set_src(_snapshot_image.get(), image_src);
 
     return true;
+}
+
+// Box filter: each output pixel is the mean of the source pixels it covers (2-3 per axis at 40 %), per RGB565
+// channel. Runs once per recents screen opening and app (164 x 200 output: about 0.2 M source reads).
+bool RecentsScreenSnapshot::updateScaledSnapshot(const lv_image_dsc_t *src, int32_t w, int32_t h)
+{
+    if ((src == nullptr) || (src->data == nullptr) || (src->header.cf != LV_COLOR_FORMAT_RGB565)) {
+        return false;
+    }
+    const int32_t sw = src->header.w;
+    const int32_t sh = src->header.h;
+    const uint32_t s_stride = (src->header.stride != 0) ? src->header.stride : (uint32_t)sw * 2;
+    if ((sw <= 0) || (sh <= 0) || (w > sw) || (h > sh)) {
+        return false;
+    }
+
+    if ((_scaled_snapshot == nullptr) || ((int32_t)_scaled_snapshot->header.w != w) ||
+            ((int32_t)_scaled_snapshot->header.h != h)) {
+        freeScaledSnapshot();
+        _scaled_snapshot = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_RGB565, 0);
+        if (_scaled_snapshot == nullptr) {
+            ESP_UTILS_LOGW("Scaled snapshot %dx%d: out of memory, scaled draw used", (int)w, (int)h);
+            return false;
+        }
+    }
+
+    const uint32_t d_stride = _scaled_snapshot->header.stride;
+    for (int32_t y = 0; y < h; y++) {
+        const int32_t y0 = y * sh / h;
+        const int32_t y1 = std::max((y + 1) * sh / h, y0 + 1);
+        uint16_t *out = (uint16_t *)(_scaled_snapshot->data + (size_t)y * d_stride);
+        for (int32_t x = 0; x < w; x++) {
+            const int32_t x0 = x * sw / w;
+            const int32_t x1 = std::max((x + 1) * sw / w, x0 + 1);
+            uint32_t r = 0, g = 0, b = 0;
+            for (int32_t sy = y0; sy < y1; sy++) {
+                const uint16_t *row = (const uint16_t *)(src->data + (size_t)sy * s_stride);
+                for (int32_t sx = x0; sx < x1; sx++) {
+                    const uint16_t c = row[sx];
+                    r += c >> 11;
+                    g += (c >> 5) & 0x3F;
+                    b += c & 0x1F;
+                }
+            }
+            const uint32_t n = (uint32_t)((y1 - y0) * (x1 - x0));
+            out[x] = (uint16_t)(((r / n) << 11) | ((g / n) << 5) | (b / n));
+        }
+    }
+    lv_image_cache_drop(_scaled_snapshot);      // same buffer, new pixels
+    return true;
+}
+
+void RecentsScreenSnapshot::freeScaledSnapshot(void)
+{
+    if (_scaled_snapshot == nullptr) {
+        return;
+    }
+    lv_image_cache_drop(_scaled_snapshot);
+    lv_draw_buf_destroy(_scaled_snapshot);
+    _scaled_snapshot = nullptr;
 }
 
 } // namespace esp_brookesia::systems::phone

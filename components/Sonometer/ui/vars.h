@@ -22,10 +22,8 @@ extern int32_t get_var_meter_value();
 extern void set_var_meter_value(int32_t value);
 extern const char *get_var_sound_level();
 extern void set_var_sound_level(const char *value);
-extern const char *get_var_fft_min_sensitivity_value();
-extern void set_var_fft_min_sensitivity_value(const char *value);
-extern const char *get_var_fft_max_sensitivity_value();
-extern void set_var_fft_max_sensitivity_value(const char *value);
+extern const char *get_var_fft_sensitivity_value();
+extern void set_var_fft_sensitivity_value(const char *value);
 extern bool get_var_fft_peaks_list_disabled();
 extern void set_var_fft_peaks_list_disabled(bool value);
 

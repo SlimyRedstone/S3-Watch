@@ -59,6 +59,7 @@ public:
                 .flags = {
                     .enable_status_icon_common_size = 1,
                     .enable_navigation_gesture = 1,
+                    .disable_navigation_gesture_back = 0,
                 },
             };
         }
@@ -74,6 +75,8 @@ public:
                                                                 common size in the status bar data */
             uint8_t enable_navigation_gesture: 1;           /*!< If set and the gesture is enabled, the navigation gesture
                                                                 will be enabled. */
+            uint8_t disable_navigation_gesture_back: 1;     /*!< (S3-Watch) If set, the left/right edge "back" swipe
+                                                                is off for this app; the bottom-edge gestures stay. */
         } flags;                                            /*!< The flags for the phone app data */
     };
 
@@ -177,6 +180,17 @@ public:
     const Config &getActiveData(void) const
     {
         return getActiveConfig();
+    }
+
+protected:
+    /**
+     * @brief (S3-Watch) Turn the left/right edge "back" swipe off for this app only. The bottom-edge gestures
+     *        (home, recents) stay. Call from the constructor: the config is copied when the app is installed.
+     *
+     */
+    void disableNavigationGestureBack(void)
+    {
+        _init_config.flags.disable_navigation_gesture_back = 1;
     }
 
 private:

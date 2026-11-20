@@ -16,6 +16,7 @@
     cont = create_text(section, icon, title, LV_MENU_ITEM_BUILDER_VARIANT_1);\
     lv_menu_set_load_page_event(menu, cont, submenu);\
 }
+#define USE_ICONS_SUBMENU_LABELS
 
 objects_t Settings_objects;
 lv_obj_t *Settings_tick_value_change_obj;
@@ -66,14 +67,16 @@ static lv_obj_t *create_text( lv_obj_t *parent, const char *icon, const char *tx
 	lv_obj_t *img = NULL;
 	lv_obj_t *label = NULL;
 
+    
 	if (icon) {
-		img = lv_image_create(obj);
+        img = lv_image_create(obj);
 		lv_image_set_src(img, icon);
 	}
-
+    
 	if (txt) {
-		label = lv_label_create(obj);
+        label = lv_label_create(obj);
 		lv_label_set_text(label, txt);
+        // lv_obj_set_style_text_font(label, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
 		lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
 		lv_obj_set_flex_grow(label, 1);
 	}
@@ -84,6 +87,29 @@ static lv_obj_t *create_text( lv_obj_t *parent, const char *icon, const char *tx
 	}
 
 	return obj;
+}
+
+#define H_SEPARATOR_WIDTH_PCT   75
+#define H_SEPARATOR_LINE_W      1
+static lv_obj_t *create_h_separator(lv_obj_t *parent ) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);                               // no bg, border, padding
+    lv_obj_set_size(row, LV_PCT(100), H_SEPARATOR_LINE_W);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *obj = lv_line_create(row);
+    lv_obj_set_size(obj, LV_PCT(H_SEPARATOR_WIDTH_PCT), H_SEPARATOR_LINE_W);
+    lv_obj_align(obj, LV_ALIGN_TOP_MID, 0, 0);
+
+    // End point in % of the line object's width: follows the parent width
+    static lv_point_precise_t Settings_line_points[] = {
+        { 0, 0 },
+        { LV_PCT(100), 0 }
+    };
+    lv_line_set_points(obj, Settings_line_points, 2);
+    lv_obj_set_style_line_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_line_width(obj, H_SEPARATOR_LINE_W, LV_PART_MAIN | LV_STATE_DEFAULT);
+    return obj;
 }
 
 // Menu row holding one clickable button. event_cb gets LV_EVENT_CLICKED, the
@@ -103,7 +129,7 @@ static lv_obj_t *create_button( lv_obj_t *parent, const char *txt, lv_event_cb_t
 		lv_label_set_text(label, txt);
 		lv_obj_set_size(label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
 		lv_obj_set_style_align(label, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-		lv_obj_set_style_text_font(label, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
+		// font: inherited, the section text size (menu font, 18)
 	}
 
 	return obj;
@@ -118,17 +144,19 @@ void Settings_create_screen_main() {
     lv_obj_set_pos(obj, 0, 0);
     lv_obj_set_size(obj, 410, 502);
     lv_obj_set_style_bg_color(obj, lv_color_hex(0xff000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(obj, &lv_font_montserrat_26, LV_PART_MAIN | LV_PART_ITEMS | LV_STATE_DEFAULT);
+    // Fonts: LV_PART_MAIN only. Parts are values, not flags (LV_PART_MAIN = 0): "LV_PART_MAIN | LV_PART_ITEMS" is
+    // LV_PART_ITEMS, which labels never inherit from, so those fonts never reached the menu text.
+    lv_obj_set_style_text_font(obj, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
     {
         lv_obj_t *parent_obj = obj;
         {
             lv_obj_t *menu = lv_menu_create(parent_obj);
             lv_obj_set_pos(menu, 0, 40);
             lv_obj_set_size(menu, LV_PCT(100), 462);
-            lv_obj_set_style_pad_left(menu, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_pad_top(menu, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_left(menu, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_top(menu, 18, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_color(menu, lv_color_hex(0xff000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_text_font(menu, &lv_font_montserrat_32, LV_PART_MAIN | LV_PART_ITEMS | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_font(menu, &lv_font_montserrat_18, LV_PART_MAIN | LV_STATE_DEFAULT);   // section text
             lv_menu_set_mode_root_back_button(menu, LV_MENU_ROOT_BACK_BUTTON_DISABLED);
             lv_menu_set_mode_header(menu, LV_MENU_HEADER_TOP_FIXED);
             // lv_obj_add_event_cb(menu, Settings_back_event_handler, LV_EVENT_CLICKED, menu);
@@ -153,20 +181,36 @@ void Settings_create_screen_main() {
                 Settings_root_page = lv_menu_page_create(menu, "Settings");
                 SET_SUBMENU_PADDING( Settings_root_page )
                 section = lv_menu_section_create(Settings_root_page);
-                
-                ADD_SUBMENU("Display", sub_display_page, (const char*)LV_SYMBOL_SETTINGS)
-                ADD_SUBMENU("Audio", sub_audio_page, (const char*)LV_SYMBOL_VOLUME_MAX)
-                ADD_SUBMENU("WiFi", sub_wifi_page, (const char*)LV_SYMBOL_WIFI)
-                ADD_SUBMENU("Bluetooth", sub_bluetooth_page,(const char*)LV_SYMBOL_BLUETOOTH)
-                ADD_SUBMENU("ESP-Now", sub_espnow_page, (const char*)LV_SYMBOL_SETTINGS)
-                ADD_SUBMENU("Upgrade", sub_upgrade_page, (const char*)LV_SYMBOL_UPLOAD)
-                ADD_SUBMENU("Battery", sub_battery_page, (const char*)LV_SYMBOL_BATTERY_FULL)
-                ADD_SUBMENU("SD Card", sub_sdcard_page, (const char*)LV_SYMBOL_SD_CARD)
-                ADD_SUBMENU("About", sub_about_page, (const char*)LV_SYMBOL_HOME)
-                ADD_SUBMENU("Developer", sub_dev_page, (const char*)LV_SYMBOL_USB)
-
+                #ifdef USE_ICONS_SUBMENU_LABELS
+                    ADD_SUBMENU("Display", sub_display_page, (const char*)LV_SYMBOL_SETTINGS)
+                    ADD_SUBMENU("Audio", sub_audio_page, (const char*)LV_SYMBOL_VOLUME_MAX)
+                    ADD_SUBMENU("WiFi", sub_wifi_page, (const char*)LV_SYMBOL_WIFI)
+                    ADD_SUBMENU("Bluetooth", sub_bluetooth_page,(const char*)LV_SYMBOL_BLUETOOTH)
+                    ADD_SUBMENU("ESP-Now", sub_espnow_page, (const char*)LV_SYMBOL_SETTINGS)
+                    ADD_SUBMENU("Upgrade", sub_upgrade_page, (const char*)LV_SYMBOL_UPLOAD)
+                    ADD_SUBMENU("Battery", sub_battery_page, (const char*)LV_SYMBOL_BATTERY_FULL)
+                    ADD_SUBMENU("SD Card", sub_sdcard_page, (const char*)LV_SYMBOL_SD_CARD)
+                    ADD_SUBMENU("About", sub_about_page, (const char*)LV_SYMBOL_HOME)
+                    ADD_SUBMENU("Developer", sub_dev_page, (const char*)LV_SYMBOL_USB)
+                #else
+                    ADD_SUBMENU("Display", sub_display_page, NULL)
+                    ADD_SUBMENU("Audio", sub_audio_page, NULL)
+                    ADD_SUBMENU("WiFi", sub_wifi_page, NULL)
+                    ADD_SUBMENU("Bluetooth", sub_bluetooth_page, NULL)
+                    ADD_SUBMENU("ESP-Now", sub_espnow_page, NULL)
+                    ADD_SUBMENU("Upgrade", sub_upgrade_page, NULL)
+                    ADD_SUBMENU("Battery", sub_battery_page, NULL)
+                    ADD_SUBMENU("SD Card", sub_sdcard_page, NULL)
+                    ADD_SUBMENU("About", sub_about_page, NULL)
+                    ADD_SUBMENU("Developer", sub_dev_page, NULL)
+                #endif
                 lv_menu_set_sidebar_page(menu, Settings_root_page);
-                lv_obj_send_event( 
+                // Sidebar: categories and "Settings" title 16 (the header is not a child of the page)
+                lv_obj_set_style_text_font(Settings_root_page, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(lv_menu_get_sidebar_header(menu), &lv_font_montserrat_18, LV_PART_MAIN | LV_STATE_DEFAULT);
+                // Sidebar width (LVGL default 30% = 123 px): "Developer" at 16 px + icon + paddings = 155 px
+                lv_obj_set_width(lv_obj_get_parent(Settings_root_page), LV_PCT(32));
+                lv_obj_send_event(
                     lv_obj_get_child( 
                         lv_obj_get_child( 
                             lv_menu_get_cur_sidebar_page(menu),
@@ -206,6 +250,8 @@ void Settings_create_screen_main() {
                 SET_SUBMENU_SEPARATOR( sub_wifi_page )
                 section = lv_menu_section_create( sub_wifi_page );
                 create_switch(section, LV_SYMBOL_WIFI, "Enable WiFi", get_wifi_value());
+                create_switch(section, LV_SYMBOL_WIFI, "Disable WiFi on boot", get_wifi_disable_on_boot_value());
+                create_text(section, LV_SYMBOL_BULLET, get_wifi_ip_address(), LV_MENU_ITEM_BUILDER_VARIANT_1);
             }
 
             //  Bluetooth Sub-Menu
@@ -241,6 +287,15 @@ void Settings_create_screen_main() {
                 section = lv_menu_section_create( sub_battery_page );
                 create_text(section, LV_SYMBOL_BATTERY_FULL, "Battery", LV_MENU_ITEM_BUILDER_VARIANT_1);
                 create_switch(section, LV_SYMBOL_IMAGE, "Display percentage", get_battery_perc_text_value());
+                
+                create_h_separator(section);
+
+                create_text(section, LV_SYMBOL_BULLET, get_battery_charge_status_label(), LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_text(section, LV_SYMBOL_BULLET, get_battery_usb_status_label(), LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_text(section, LV_SYMBOL_BULLET, get_battery_voltage_label(), LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_text(section, LV_SYMBOL_BULLET, get_battery_ac_voltage_label(), LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_text(section, LV_SYMBOL_BULLET, get_battery_estimated_life_label(), LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_text(section, LV_SYMBOL_BULLET, get_battery_estimated_sleep_life_label(), LV_MENU_ITEM_BUILDER_VARIANT_1);
             }
 
             //  SD Card Sub-Menu
@@ -259,7 +314,7 @@ void Settings_create_screen_main() {
                 create_text(section, NULL, "About", LV_MENU_ITEM_BUILDER_VARIANT_1);
                 create_text(section, NULL, get_version_value("Current: ", NULL), LV_MENU_ITEM_BUILDER_VARIANT_1);
                 create_text(section, NULL, "Created by SlimyRedstone", LV_MENU_ITEM_BUILDER_VARIANT_1);
-                create_button(section, "Test", action_button_pressed, BUTTON_TEST);
+                // create_button(section, "Test", action_button_pressed, BUTTON_TEST);
             }
             //  Developer Sub-Menu
             {

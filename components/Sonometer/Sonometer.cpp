@@ -8,11 +8,16 @@
 #include "esp_lib_utils.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>
 
+#include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
+#include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -85,8 +90,8 @@ static uint32_t s_fft_view_cols = 0;                    // columns of the shown 
 static int32_t *s_fft_top = nullptr;                    // first lit row of each pixel column as drawn in the mask now (LVGL task)
 static char s_fft_label_text[FFT_SCALE_LABELS_MAX][16]; // fft_frequency_scale labels, computed from the log axis
 static const char *s_fft_labels[FFT_SCALE_LABELS_MAX + 1];
-static int32_t s_fft_db_min = FFT_GRAPH_DB_MIN;         // dB, bottom of fft_graph, from fft_min_sens_slider (LVGL task)
-static int32_t s_fft_db_max = FFT_GRAPH_DB_MAX;         // dB, top of fft_graph, from fft_max_sens_slider (LVGL task)
+static int32_t s_fft_db_min = FFT_GRAPH_DB_MIN;         // dB, bottom of fft_graph, fft_sens_slider left knob (LVGL task)
+static int32_t s_fft_db_max = FFT_GRAPH_DB_MAX;         // dB, top of fft_graph, fft_sens_slider right knob (LVGL task)
 static constexpr float FFT_DB_EMPTY = -1000.0f;         // column with no spectrum yet: below any range
 
 // fft_frequency_scale sections, drawn by fft_draw_cb as bands over the plot (see fft_scale_set_log)
@@ -109,13 +114,22 @@ struct fft_peak_t {
 static fft_peak_t s_fft_peaks_out[FFT_PEAKS_MAX];       // published with the spectrum, strongest first (fft_mux)
 static uint32_t s_fft_peaks_out_n = 0;
 static volatile bool s_fft_peaks_on = true;             // !fft_peaks_list_disabled: fft_task skips the search otherwise
-static lv_obj_t *s_fft_peak_labels[FFT_PEAKS_MAX];      // one label per fft_peaks_list row (LVGL task)
+static lv_obj_t *s_fft_peak_labels[FFT_PEAKS_MAX];      // one label per fft_peaks_list cell (LVGL task)
+static lv_color_t s_fft_peak_colors[FFT_PEAKS_MAX];     // colour of each cell, red -> blue (LVGL task)
+
+// Bars of the listed peaks, drawn in their cell's colour by fft_draw_cb (LVGL task)
+struct fft_peak_mark_t {
+    int32_t x0;                                         // image pixel columns [x0, x1) of the bar (gap column excluded)
+    int32_t x1;
+    uint32_t rank;                                      // cell index: colour s_fft_peak_colors[rank]
+};
+static fft_peak_mark_t s_fft_marks[FFT_PEAKS_MAX];
+static uint32_t s_fft_mark_n = 0;
 static uint32_t s_fft_peak_rows = 0;
 static uint32_t s_fft_peaks_tick = 0;                   // lv_tick of the last list update
 
 // EEZ variables of the Options tab: LVGL task only (actions, callbacks, Sonometer_ui_tick)
-static char s_fft_min_sens_text[16] = {0};
-static char s_fft_max_sens_text[16] = {0};
+static char s_fft_sens_text[32] = {0};                  // fft_sens_value_label: "16dB to 54dB"
 static bool s_fft_peaks_disabled = false;
 
 // EEZ variables: written by sound_task, read by Sonometer_ui_tick() in the LVGL task
@@ -307,12 +321,273 @@ static uint32_t fft_selected_bars(void) {
 }
 
 /*
+@brief Sets both knobs of a range slider (values clamped to its range). LVGL 9.2 keeps left <= right on every call
+       (lv_bar_set_start_value clamps to the current value, lv_bar_set_value to the start value): order by direction
+*/
+static void range_slider_set(lv_obj_t *slider, int32_t lo, int32_t hi) {
+    if (slider == nullptr) return;
+    if (lo > hi) std::swap(lo, hi);
+    if (lo > lv_slider_get_value(slider)) {                                 // moving up: right knob first
+        lv_slider_set_value(slider, hi, LV_ANIM_OFF);
+        lv_slider_set_left_value(slider, lo, LV_ANIM_OFF);
+    } else {                                                                // moving down: left knob first
+        lv_slider_set_left_value(slider, lo, LV_ANIM_OFF);
+        lv_slider_set_value(slider, hi, LV_ANIM_OFF);
+    }
+}
+
+// ===========================================================================
+// Options persistence (SONOMETER_PARAMS_FILE on the SD card), LVGL task only
+// ===========================================================================
+using esp_brookesia::apps::Settings;
+
+static constexpr const char *PARAMS_DIR = BSP_SD_MOUNT_POINT "/apps";
+static constexpr const char *PARAMS_PATH = BSP_SD_MOUNT_POINT "/" SONOMETER_PARAMS_FILE;
+static constexpr const char *PARAMS_BAD_PATH = BSP_SD_MOUNT_POINT "/" SONOMETER_PARAMS_BAD_FILE;
+
+struct sono_params_t {
+    int32_t fft_bars;                                   // "bars": n_bars_selector option
+    int32_t fft_db_min;                                 // "min_db": fft_sens_slider left knob
+    int32_t fft_db_max;                                 // "max_db": fft_sens_slider right knob
+    bool fft_peaks_hidden;                              // "hide_peaks": fft_options_peaks_disabled_switch
+    int32_t fft_peaks;                                  // "peaks": fft_peaks_n_selector option
+};
+static sono_params_t s_params = {};                     // what the Options tab shows (kept between openings)
+static bool s_params_valid = false;                     // s_params set by an opening
+static bool s_params_dirty = false;                     // changed since the last successful save
+static lv_timer_t *s_params_timer = nullptr;            // debounced save, paused when idle
+
+static bool params_equal(const sono_params_t &a, const sono_params_t &b) {
+    return a.fft_bars == b.fft_bars && a.fft_db_min == b.fft_db_min && a.fft_db_max == b.fft_db_max &&
+           a.fft_peaks_hidden == b.fft_peaks_hidden && a.fft_peaks == b.fft_peaks;
+}
+
+/*
+@brief Options tab -> parameters (the widgets are the reference: their initial values are the defaults)
+*/
+static sono_params_t params_from_widgets(void) {
+    sono_params_t p = {};
+    lv_obj_t *sens = Sonometer_objects.fft_sens_slider;
+    lv_obj_t *peaks_switch = Sonometer_objects.fft_options_peaks_disabled_switch;
+    p.fft_bars = (int32_t)fft_selected_bars();
+    p.fft_db_min = (sens != nullptr) ? lv_slider_get_left_value(sens) : FFT_GRAPH_DB_MIN;
+    p.fft_db_max = (sens != nullptr) ? lv_slider_get_value(sens) : FFT_GRAPH_DB_MAX;
+    p.fft_peaks_hidden = (peaks_switch != nullptr) && lv_obj_has_state(peaks_switch, LV_STATE_CHECKED);
+    p.fft_peaks = (int32_t)fft_dropdown_number(Sonometer_objects.fft_peaks_n_selector, FFT_PEAKS_DEFAULT);
+    return p;
+}
+
+/*
+@brief Selects the dropdown option whose number is nearest to value (options are numbers: "16\n32\n64...")
+*/
+static void dropdown_select_nearest(lv_obj_t *dropdown, int32_t value, const char *key) {
+    if (dropdown == nullptr) return;
+    const char *p = lv_dropdown_get_options(dropdown);
+    uint32_t index = 0;
+    uint32_t best_index = lv_dropdown_get_selected(dropdown);
+    long best_number = 0;
+    long best_diff = -1;
+    while (p != nullptr && *p != '\0') {
+        char *end = nullptr;
+        const long number = strtol(p, &end, 10);
+        if (end != p) {
+            const long diff = labs(number - (long)value);
+            if (best_diff < 0 || diff < best_diff) {
+                best_diff = diff;
+                best_index = index;
+                best_number = number;
+            }
+        }
+        p = strchr(p, '\n');
+        if (p != nullptr) p++;
+        index++;
+    }
+    if (best_diff > 0) ESP_LOGW(TAG, "%s: %d is not an option, %ld used", key, (int)value, best_number);
+    lv_dropdown_set_selected(dropdown, best_index);
+}
+
+/*
+@brief Parameters -> Options tab, before sound_graph_setup / fft_options_setup read it (no event is sent)
+*/
+static void params_to_widgets(const sono_params_t &p) {
+    dropdown_select_nearest(Sonometer_objects.n_bars_selector, p.fft_bars, "fft.bars");
+    range_slider_set(Sonometer_objects.fft_sens_slider, p.fft_db_min, p.fft_db_max);   // clamped to its range
+    if (Sonometer_objects.fft_options_peaks_disabled_switch != nullptr) {
+        lv_obj_set_state(Sonometer_objects.fft_options_peaks_disabled_switch, LV_STATE_CHECKED, p.fft_peaks_hidden);
+    }
+    dropdown_select_nearest(Sonometer_objects.fft_peaks_n_selector, p.fft_peaks, "fft.peaks");
+}
+
+static int json_take_int(cJSON *obj, const char *key, int32_t &out) {
+    cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!cJSON_IsNumber(v)) return 0;
+    out = v->valueint;                                  // cJSON saturates it to the int range
+    return 1;
+}
+
+static int json_take_bool(cJSON *obj, const char *key, bool &out) {
+    cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!cJSON_IsBool(v)) return 0;
+    out = cJSON_IsTrue(v);
+    return 1;
+}
+
+/*
+@brief Reads PARAMS_PATH over p (keys it lacks keep p's values)
+@return false without a readable JSON file; complete = every key present with the right type
+*/
+static bool params_load(sono_params_t &p, bool &complete) {
+    complete = false;
+    FILE *f = fopen(PARAMS_PATH, "r");
+    if (f == nullptr) return false;
+    char *buf = (char *)calloc(1, SONOMETER_PARAMS_FILE_MAX);
+    if (buf == nullptr) {
+        fclose(f);
+        return false;
+    }
+    const size_t n = fread(buf, 1, SONOMETER_PARAMS_FILE_MAX - 1, f);
+    fclose(f);
+    cJSON *j = (n > 0) ? cJSON_Parse(buf) : nullptr;
+    free(buf);
+    if (j == nullptr) {
+        remove(PARAMS_BAD_PATH);
+        const bool kept = (rename(PARAMS_PATH, PARAMS_BAD_PATH) == 0);
+        ESP_LOGE(TAG, "%s is not valid JSON%s, defaults used", PARAMS_PATH, kept ? " (kept as sonometer.bad.json)" : "");
+        return false;
+    }
+    cJSON *fft = cJSON_GetObjectItem(j, "fft");
+    int found = 0;
+    found += json_take_int(fft, "bars", p.fft_bars);
+    found += json_take_int(fft, "min_db", p.fft_db_min);
+    found += json_take_int(fft, "max_db", p.fft_db_max);
+    found += json_take_bool(fft, "hide_peaks", p.fft_peaks_hidden);
+    found += json_take_int(fft, "peaks", p.fft_peaks);
+    cJSON_Delete(j);
+    complete = (found == 5);
+    return true;
+}
+
+static bool params_save(const sono_params_t &p) {
+    if (!Settings::isSdMounted()) return false;
+    if (mkdir(PARAMS_DIR, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG, "Options not saved: cannot create %s (errno %d)", PARAMS_DIR, errno);
+        return false;
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON *fft = (j != nullptr) ? cJSON_AddObjectToObject(j, "fft") : nullptr;
+    if (fft == nullptr) {
+        cJSON_Delete(j);
+        return false;
+    }
+    cJSON_AddNumberToObject(fft, "bars", p.fft_bars);
+    cJSON_AddNumberToObject(fft, "min_db", p.fft_db_min);
+    cJSON_AddNumberToObject(fft, "max_db", p.fft_db_max);
+    cJSON_AddBoolToObject(fft, "hide_peaks", p.fft_peaks_hidden);
+    cJSON_AddNumberToObject(fft, "peaks", p.fft_peaks);
+    char *text = cJSON_Print(j);
+    cJSON_Delete(j);
+    if (text == nullptr) return false;
+
+    bool ok = false;
+    FILE *f = fopen(PARAMS_PATH, "w");
+    if (f != nullptr) {
+        ok = (fputs(text, f) >= 0);
+        ok = (fclose(f) == 0) && ok;
+    }
+    cJSON_free(text);
+    if (ok) ESP_LOGI(TAG, "Options saved to %s", PARAMS_PATH);
+    else ESP_LOGW(TAG, "Options not saved: cannot write %s (card removed?)", PARAMS_PATH);
+    return ok;
+}
+
+static void params_save_now(void) {
+    if (s_params_dirty && params_save(s_params)) s_params_dirty = false;
+}
+
+static void params_timer_cb(lv_timer_t *timer) {
+    lv_timer_pause(timer);
+    params_save_now();
+}
+
+/*
+@brief A widget of the Options tab changed: new parameters, saved SONOMETER_PARAMS_SAVE_DELAY_MS after the last change
+*/
+static void params_changed(void) {
+    const sono_params_t p = params_from_widgets();
+    if (s_params_valid && params_equal(p, s_params)) return;
+    s_params = p;
+    s_params_valid = true;
+    s_params_dirty = true;
+    if (s_params_timer == nullptr) {
+        s_params_timer = lv_timer_create(params_timer_cb, SONOMETER_PARAMS_SAVE_DELAY_MS, nullptr);
+        if (s_params_timer == nullptr) {
+            params_save_now();
+            return;
+        }
+    }
+    lv_timer_reset(s_params_timer);
+    lv_timer_resume(s_params_timer);
+}
+
+/*
+@brief run(): file (or the last opening's values, or the UI defaults) -> Options tab, file rewritten when it differs
+*/
+static void params_setup(void) {
+    Settings::ensureLoaded();                                               // the SD card is mounted by Settings
+    sono_params_t p = s_params_valid ? s_params : params_from_widgets();
+    bool complete = false;
+    // a change that could not be saved (card pulled out) is newer than the file: keep it, save it again
+    const bool loaded = !s_params_dirty && Settings::isSdMounted() && params_load(p, complete);
+    if (!Settings::isSdMounted()) ESP_LOGW(TAG, "No SD card: options kept until the watch restarts");
+
+    params_to_widgets(p);
+    s_params = params_from_widgets();                                       // nearest dropdown options, clamped sliders
+    s_params_valid = true;
+    if (!loaded || !complete || !params_equal(s_params, p)) s_params_dirty = true;
+    params_save_now();
+    ESP_LOGI(TAG, "Options: %d bars, %d..%d dB, peaks %s (%d)", (int)s_params.fft_bars, (int)s_params.fft_db_min,
+             (int)s_params.fft_db_max, s_params.fft_peaks_hidden ? "hidden" : "shown", (int)s_params.fft_peaks);
+}
+
+static void params_close(void) {
+    if (s_params_timer != nullptr) {
+        lv_timer_delete(s_params_timer);
+        s_params_timer = nullptr;
+    }
+    params_save_now();                                                      // a change still in its save delay
+}
+
+/*
 @brief Plot area of fft_graph (inside its padding + border), where the spectrum image is drawn
 */
 static void fft_plot_area(lv_obj_t *chart, lv_area_t *area) {
     lv_obj_get_content_coords(chart, area);
     area->x2 = area->x1 + s_fft_img_w - 1;
     area->y2 = area->y1 + s_fft_img_h - 1;
+}
+
+/*
+@brief Redraws image pixel columns [x0, x1) of fft_graph, whole plot height
+*/
+static void fft_invalidate_columns(int32_t x0, int32_t x1) {
+    lv_obj_t *chart = Sonometer_objects.fft_graph;
+    if (chart == nullptr || x1 <= x0) return;
+    lv_area_t plot;
+    fft_plot_area(chart, &plot);
+    lv_area_t a;
+    a.x1 = plot.x1 + x0;
+    a.x2 = plot.x1 + x1 - 1;
+    a.y1 = plot.y1;
+    a.y2 = plot.y2;
+    lv_obj_invalidate_area(chart, &a);
+}
+
+/*
+@brief Peak bars back to the bar colour (peaks hidden, bar layout or cell count changed)
+*/
+static void fft_peaks_unmark(void) {
+    for (uint32_t i = 0; i < s_fft_mark_n; i++) fft_invalidate_columns(s_fft_marks[i].x0, s_fft_marks[i].x1);
+    s_fft_mark_n = 0;
 }
 
 static void fft_image_free(void) {
@@ -457,6 +732,26 @@ static void fft_draw_cb(lv_event_t *e) {
     lv_draw_image_dsc_init(&dsc);
     dsc.src = &s_fft_img;
     lv_draw_image(layer, &dsc, &area);
+
+    // peak bars in their list colour: one opaque rectangle over each, from its current top (s_fft_top, the same state
+    // the image mask was rendered from) to the bottom. At most FFT_PEAKS_MAX small draw tasks, no image rewrite
+    if (s_fft_mark_n == 0 || s_fft_top == nullptr) return;
+    lv_draw_rect_dsc_t rect;
+    lv_draw_rect_dsc_init(&rect);
+    rect.radius = 0;
+    rect.bg_opa = LV_OPA_COVER;
+    for (uint32_t k = s_fft_mark_n; k-- > 0;) {                             // strongest last: on top if two share a column
+        const fft_peak_mark_t &m = s_fft_marks[k];
+        const int32_t top = s_fft_top[m.x0];
+        if (top >= s_fft_img_h) continue;                                   // bar empty
+        lv_area_t a;
+        a.x1 = area.x1 + m.x0;
+        a.x2 = area.x1 + m.x1 - 1;
+        a.y1 = area.y1 + top;
+        a.y2 = area.y1 + s_fft_img_h - 1;
+        rect.bg_color = s_fft_peak_colors[m.rank];
+        lv_draw_rect(layer, &rect, &a);
+    }
 }
 
 /*
@@ -464,6 +759,7 @@ static void fft_draw_cb(lv_event_t *e) {
 */
 static void fft_apply_bars(uint32_t bars) {
     bars = std::clamp<uint32_t>(bars, 1, FFT_BINS);
+    fft_peaks_unmark();                                                     // marks were columns of the old layout
     s_fft_bars = bars;
     s_fft_view_cols = fft_columns(bars, s_fft_plot_w);
     if (s_fft_view != nullptr) {
@@ -477,6 +773,7 @@ static void fft_apply_bars(uint32_t bars) {
 static void fft_bars_changed_cb(lv_event_t *e) {
     (void)e;
     fft_apply_bars(fft_selected_bars());
+    params_changed();
 }
 
 /*
@@ -491,49 +788,85 @@ static void fft_apply_range(void) {
 }
 
 /*
-@brief One Options-tab slider: its value label (EEZ variable, "%ddB") and the fft_graph range end it sets
-@return false if the object is not one of the sensitivity sliders
+@brief fft_sens_slider (range mode): left knob = bottom of fft_graph, right knob = top; label "16dB to 54dB"
+       (EEZ variable fft_sensitivity_value, shown in fft_sens_value_label)
+@return false if the object is not fft_sens_slider
 */
 static bool fft_options_slider_apply(lv_obj_t *slider) {
-    if (slider == nullptr) return false;
-    const int32_t value = lv_slider_get_value(slider);
-    char text[16];
-    snprintf(text, sizeof(text), "%ddB", (int)value);
-    if (slider == Sonometer_objects.fft_min_sens_slider) {
-        set_var_fft_min_sensitivity_value(text);
-        s_fft_db_min = value;
-    } else if (slider == Sonometer_objects.fft_max_sens_slider) {
-        set_var_fft_max_sensitivity_value(text);
-        s_fft_db_max = value;
-    } else {
-        return false;
-    }
+    if (slider == nullptr || slider != Sonometer_objects.fft_sens_slider) return false;
+    s_fft_db_min = lv_slider_get_left_value(slider);
+    s_fft_db_max = lv_slider_get_value(slider);
+    char text[32];
+    snprintf(text, sizeof(text), "%ddB to %ddB", (int)s_fft_db_min, (int)s_fft_db_max);
+    set_var_fft_sensitivity_value(text);
     return true;
 }
 
 /*
-@brief Rebuilds fft_peaks_list with one row per peak, row count from fft_peaks_n_selector
-@note Rows are list buttons made non-clickable (display only, the list still scrolls), "-" until a peak fills them
+@brief fft_peaks_list grid tracks: FFT_PEAKS_GRID_COLS equal columns, one content-high row per started line of cells
+@note The EEZ export gives the list LV_LAYOUT_GRID with the track *sizes* {4} (rows) and {3} (columns), i.e. one 4 px row
+      and one 3 px column in LVGL: the tracks are replaced here (3 columns x 4 rows for 10 peaks)
+@note The arrays stay referenced by the style: static
+*/
+static int32_t s_peaks_col_dsc[FFT_PEAKS_GRID_COLS + 1];
+static int32_t s_peaks_row_dsc[FFT_PEAKS_MAX + 1];
+
+static void fft_peaks_grid_setup(lv_obj_t *list, uint32_t cells) {
+    for (uint32_t c = 0; c < FFT_PEAKS_GRID_COLS; c++) s_peaks_col_dsc[c] = LV_GRID_FR(1);
+    s_peaks_col_dsc[FFT_PEAKS_GRID_COLS] = LV_GRID_TEMPLATE_LAST;
+    const uint32_t rows = std::max<uint32_t>((cells + FFT_PEAKS_GRID_COLS - 1) / FFT_PEAKS_GRID_COLS, 1);
+    for (uint32_t r = 0; r < rows; r++) s_peaks_row_dsc[r] = LV_GRID_CONTENT;
+    s_peaks_row_dsc[rows] = LV_GRID_TEMPLATE_LAST;
+    lv_obj_set_style_grid_column_dsc_array(list, s_peaks_col_dsc, LV_PART_MAIN);   // = the export's MAIN | DEFAULT
+    lv_obj_set_style_grid_row_dsc_array(list, s_peaks_row_dsc, LV_PART_MAIN);
+    lv_obj_set_layout(list, LV_LAYOUT_GRID);
+    lv_obj_set_style_pad_hor(list, FFT_PEAKS_LIST_PAD_HOR, LV_PART_MAIN);  // wider cells: 4-digit peaks fit
+}
+
+/*
+@brief Colour of cell i of n: hue from FFT_PEAKS_HUE_FIRST (red) to FFT_PEAKS_HUE_LAST (blue), one cell = one step
+*/
+static lv_color_t fft_peak_color(uint32_t i, uint32_t n) {
+    const int32_t span = FFT_PEAKS_HUE_LAST - FFT_PEAKS_HUE_FIRST;
+    const int32_t hue = FFT_PEAKS_HUE_FIRST + ((n > 1) ? span * (int32_t)i / (int32_t)(n - 1) : 0);
+    return lv_color_hsv_to_rgb((uint16_t)hue, FFT_PEAKS_COLOR_SAT, FFT_PEAKS_COLOR_VAL);
+}
+
+/*
+@brief Rebuilds fft_peaks_list with one cell per peak, count from fft_peaks_n_selector, filled left to right then top
+       to bottom (strongest first), each cell in its colour (fft_peak_color)
+@note Cells are list buttons made non-clickable (display only, the list still scrolls), "-" until a peak fills them.
+      Padding reduced (FFT_PEAKS_CELL_PAD_*) so 4 rows fit the list. Labels clip instead of scrolling: a scrolling
+      label restarts on every text change, so a value updated 4 times a second could not be read
 */
 static void fft_peaks_build_rows(void) {
     lv_obj_t *list = Sonometer_objects.fft_peaks_list;
+    fft_peaks_unmark();                                                     // colours depend on the cell count
     s_fft_peak_rows = 0;
     if (list == nullptr) return;
     lv_obj_clean(list);
     const uint32_t n = std::min<uint32_t>(fft_dropdown_number(Sonometer_objects.fft_peaks_n_selector, FFT_PEAKS_DEFAULT),
                                           FFT_PEAKS_MAX);
+    fft_peaks_grid_setup(list, n);
     for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *row = lv_list_add_button(list, nullptr, "-");
-        lv_obj_t *label = (row != nullptr) ? lv_obj_get_child(row, 0) : nullptr;
+        lv_obj_t *cell = lv_list_add_button(list, nullptr, "-");
+        lv_obj_t *label = (cell != nullptr) ? lv_obj_get_child(cell, 0) : nullptr;
         if (label == nullptr) break;
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_pad_ver(cell, FFT_PEAKS_CELL_PAD_VER, LV_PART_MAIN);
+        lv_obj_set_style_pad_hor(cell, FFT_PEAKS_CELL_PAD_HOR, LV_PART_MAIN);
+        lv_obj_set_grid_cell(cell, LV_GRID_ALIGN_STRETCH, (int32_t)(i % FFT_PEAKS_GRID_COLS), 1,
+                             LV_GRID_ALIGN_STRETCH, (int32_t)(i / FFT_PEAKS_GRID_COLS), 1);
+        s_fft_peak_colors[i] = fft_peak_color(i, n);
+        lv_obj_set_style_text_color(label, s_fft_peak_colors[i], LV_PART_MAIN);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
         s_fft_peak_labels[s_fft_peak_rows++] = label;
     }
     s_fft_peaks_tick = lv_tick_get() - FFT_PEAKS_UPDATE_PERIOD_MS;          // filled by the next spectrum
 }
 
 /*
-@brief Writes the peaks into fft_peaks_list rows, "%0.0fHz (%0.1fdB)", strongest first; rows without a peak show "-"
+@brief Writes the peaks into the fft_peaks_list cells, "%0.0fHz (%0.1fdB)", strongest first; cells without a peak show "-"
 */
 static void fft_peaks_show(const fft_peak_t *peaks, uint32_t n) {
     char text[48];
@@ -546,12 +879,59 @@ static void fft_peaks_show(const fft_peak_t *peaks, uint32_t n) {
 }
 
 /*
+@brief Image pixel columns [x0, x1) of the bar showing a peak, false when it is outside the plot
+@note The bar holding the peak's bin centre (fft_band_power averages the bins centred in a bar), then the column that
+      bar is drawn in (fft_columns: several bars per pixel when they outnumber the pixels), as fft_render lays it out
+*/
+static bool fft_peak_columns(float hz, fft_peak_mark_t &m) {
+    const int32_t w = s_fft_img_w;
+    const uint32_t bars = s_fft_bars;
+    const uint32_t cols = s_fft_view_cols;
+    const float f_lo = s_fft_f_lo;
+    const float f_hi = s_fft_f_hi;
+    if (w <= 0 || bars == 0 || cols == 0 || cols > (uint32_t)w || !(f_lo > 0.0f) || !(f_hi > f_lo)) return false;
+    const float bin_hz = (float)I2S_MIC_SAMPLE_RATE / (float)FFT_SIZE;
+    const float centre = roundf(hz / bin_hz) * bin_hz;
+    if (centre < f_lo || centre >= f_hi) return false;
+    const uint32_t bar = std::min<uint32_t>((uint32_t)((float)bars * log2f(centre / f_lo) / log2f(f_hi / f_lo)), bars - 1);
+    const int32_t c = (int32_t)((cols == bars) ? bar : bar * cols / bars);
+    m.x0 = c * w / (int32_t)cols;
+    m.x1 = (c + 1) * w / (int32_t)cols;
+    if (w / (int32_t)cols >= FFT_GRAPH_GAP_FROM_PX) m.x1--;                 // same gap column as fft_render
+    return m.x1 > m.x0;
+}
+
+/*
+@brief Bars of the listed peaks get their cell's colour (drawn by fft_draw_cb); redraws the columns that changed
+*/
+static void fft_peaks_mark(const fft_peak_t *peaks, uint32_t n) {
+    fft_peak_mark_t marks[FFT_PEAKS_MAX];
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < n && i < s_fft_peak_rows; i++) {
+        fft_peak_mark_t m;
+        if (!fft_peak_columns(peaks[i].hz, m)) continue;
+        m.rank = i;
+        marks[count++] = m;
+    }
+    bool same = (count == s_fft_mark_n);
+    for (uint32_t i = 0; same && i < count; i++) {
+        same = marks[i].x0 == s_fft_marks[i].x0 && marks[i].x1 == s_fft_marks[i].x1 && marks[i].rank == s_fft_marks[i].rank;
+    }
+    if (same) return;
+    fft_peaks_unmark();                                                     // old colours away
+    memcpy(s_fft_marks, marks, count * sizeof(fft_peak_mark_t));
+    s_fft_mark_n = count;
+    for (uint32_t i = 0; i < count; i++) fft_invalidate_columns(marks[i].x0, marks[i].x1);
+}
+
+/*
 @brief fft_options_peaks_disabled_switch state: hides fft_peaks_list, disables fft_peaks_n_selector,
        sets fft_peaks_list_disabled, and stops the peak search
 */
 static void fft_peaks_apply_disabled(bool disabled) {
     set_var_fft_peaks_list_disabled(disabled);
     s_fft_peaks_on = !disabled;
+    if (disabled) fft_peaks_unmark();                                       // all bars white again
     lv_obj_t *list = Sonometer_objects.fft_peaks_list;
     if (list != nullptr) {
         if (disabled) lv_obj_add_flag(list, LV_OBJ_FLAG_HIDDEN);
@@ -563,11 +943,13 @@ static void fft_peaks_apply_disabled(bool disabled) {
 
 static void fft_peaks_switch_cb(lv_event_t *e) {
     fft_peaks_apply_disabled(lv_obj_has_state(lv_event_get_target_obj(e), LV_STATE_CHECKED));
+    params_changed();
 }
 
 static void fft_peaks_n_changed_cb(lv_event_t *e) {
     (void)e;
     fft_peaks_build_rows();
+    params_changed();
 }
 
 /*
@@ -610,6 +992,7 @@ static void fft_timer_cb(lv_timer_t *timer) {
     if (s_fft_peaks_on && s_fft_peak_rows > 0 && lv_tick_elaps(s_fft_peaks_tick) >= FFT_PEAKS_UPDATE_PERIOD_MS) {
         s_fft_peaks_tick = lv_tick_get();
         fft_peaks_show(peaks, n_peaks);
+        fft_peaks_mark(peaks, n_peaks);                                     // bars in the cells' colours, same values
     }
 }
 
@@ -621,8 +1004,7 @@ static void fft_timer_cb(lv_timer_t *timer) {
 static void fft_options_setup(void) {
     s_fft_db_min = FFT_GRAPH_DB_MIN;
     s_fft_db_max = FFT_GRAPH_DB_MAX;
-    fft_options_slider_apply(Sonometer_objects.fft_min_sens_slider);
-    fft_options_slider_apply(Sonometer_objects.fft_max_sens_slider);
+    fft_options_slider_apply(Sonometer_objects.fft_sens_slider);
     fft_apply_range();
 
     lv_obj_t *peaks_switch = Sonometer_objects.fft_options_peaks_disabled_switch;
@@ -770,18 +1152,11 @@ static void copy_text(char *dst, size_t size, const char *src) {
     dst[n] = '\0';
 }
 
-const char *get_var_fft_min_sensitivity_value() {
-    return s_fft_min_sens_text;
+const char *get_var_fft_sensitivity_value() {
+    return s_fft_sens_text;
 }
-void set_var_fft_min_sensitivity_value(const char *value) {
-    copy_text(s_fft_min_sens_text, sizeof(s_fft_min_sens_text), value);
-}
-
-const char *get_var_fft_max_sensitivity_value() {
-    return s_fft_max_sens_text;
-}
-void set_var_fft_max_sensitivity_value(const char *value) {
-    copy_text(s_fft_max_sens_text, sizeof(s_fft_max_sens_text), value);
+void set_var_fft_sensitivity_value(const char *value) {
+    copy_text(s_fft_sens_text, sizeof(s_fft_sens_text), value);
 }
 
 bool get_var_fft_peaks_list_disabled() {
@@ -792,10 +1167,13 @@ void set_var_fft_peaks_list_disabled(bool value) {
 }
 
 /*
-@brief EEZ action of fft_min_sens_slider and fft_max_sens_slider (LV_EVENT_VALUE_CHANGED): value label + fft_graph range
+@brief EEZ action of fft_sens_slider (LV_EVENT_VALUE_CHANGED, either knob): value label + fft_graph range
 */
 void action_fft_options_slider_changed(lv_event_t *e) {
-    if (fft_options_slider_apply(lv_event_get_target_obj(e))) fft_apply_range();
+    if (fft_options_slider_apply(lv_event_get_target_obj(e))) {
+        fft_apply_range();
+        params_changed();                                                   // saved once the drag stops
+    }
 }
 
 } // extern "C"
@@ -1202,6 +1580,7 @@ Sonometer::~Sonometer() { _instance = nullptr; }
 bool Sonometer::run()
 {
     Sonometer_ui_init();                                                    // EEZ Studio entry. Builds widgets on the active screen.
+    params_setup();                                                         // apps/sonometer.json -> Options tab, read below
     sound_graph_setup(Sonometer_objects.sound_graph, Sonometer_objects.graph_scale);
     fft_options_setup();                                                    // after the FFT graph: sets its range
     graph_series = nullptr;                                                 // new chart: its series is added on the first point
@@ -1238,6 +1617,8 @@ bool Sonometer::close()
     graph_series = nullptr;
     s_fft_active = false;
     s_fft_peak_rows = 0;                                                    // its labels go with the screen
+    s_fft_mark_n = 0;                                                       // no invalidation: the chart goes too
+    params_close();                                                         // pending option change -> SD card
     sound_stop();
     return true;
 }
