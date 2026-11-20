@@ -31,6 +31,7 @@ enum ScreensEnum {
 static lv_obj_t *create_text( lv_obj_t *parent, const char *icon, const char *txt, lv_menu_builder_variant_t builder_variant);
 static lv_obj_t *create_slider( lv_obj_t *parent, const char *icon, const char *txt, int32_t min, int32_t max, int32_t val);
 static lv_obj_t *create_switch( lv_obj_t *parent, const char *icon, const char *txt, bool chk);
+static lv_obj_t *create_button( lv_obj_t *parent, const char *txt, lv_event_cb_t event_cb, int32_t user_id);
 
 void Settings_create_screen_main();
 void Settings_tick_screen_main();

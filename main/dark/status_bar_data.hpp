@@ -34,7 +34,10 @@ constexpr StatusBar::Data STYLESHEET_410_502_DARK_STATUS_BAR_DATA = {
         .data = {
             STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(30, StatusBar::AreaAlign::START),
             STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(40, StatusBar::AreaAlign::CENTER),
-            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(30, StatusBar::AreaAlign::END),
+            // Icon area: 62 % so 5 icons + the battery percentage fit beside the 60 px corner offset
+            // (30 % left room for 3 icons; Brookesia hides an icon that does not fit when it is added).
+            // It overlaps the clock area; Settings::layoutStatusBar() moves the clock left when needed.
+            STYLESHEET_410_502_DARK_STATUS_BAR_AREA_DATA(62, StatusBar::AreaAlign::END),
         },
     },
     .icon_common_size = gui::StyleSize::SQUARE_PERCENT(40),
@@ -75,7 +78,7 @@ constexpr StatusBar::Data STYLESHEET_410_502_DARK_STATUS_BAR_DATA = {
         .enable_main_size_max = 1,
         .enable_battery_icon = 1,
         .enable_battery_icon_common_size = 1,
-        .enable_battery_label = 0,
+        .enable_battery_label = 1,          // shown/hidden by Settings > Battery > Display percentage
         .enable_wifi_icon = 1,
         .enable_wifi_icon_common_size = 1,
         .enable_clock = 1,

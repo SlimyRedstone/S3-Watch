@@ -22,6 +22,14 @@ extern "C" {
 bool get_sleep_charge_button_value(void);
 void set_sleep_charge_button_value(bool value);
 
+// Battery > "Display percentage" (also missing from actions.h)
+bool get_battery_perc_text_value(void);
+void set_battery_perc_text_value(bool value);
+
+// Developer > "Enable Performance counter" (also missing from actions.h)
+bool get_developer_performance_value(void);
+void set_developer_performance_value(bool value);
+
 #ifdef __cplusplus
 }
 #endif

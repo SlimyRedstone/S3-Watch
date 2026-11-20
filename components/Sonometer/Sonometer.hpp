@@ -68,7 +68,8 @@ static_assert(SOUND_UPDATE_RATE_HZ > 0 && SOUND_UPDATE_RATE_HZ <= 1000, "SOUND_U
 */
 #define FFT_SIZE                    CONFIG_DSP_MAX_FFT_SIZE // esp-dsp table size (menuconfig: DSP_MAX_FFT_SIZE)
 #define FFT_BINS                    (FFT_SIZE / 2)
-#define FFT_UPDATE_PERIOD_MS        20                  // 30 spectra per second, each one spans FFT_SIZE samples (171 ms @ 8192)
+#define FFT_UPDATE_PERIOD_MS        50                  // 20 spectra per second, each one spans FFT_SIZE samples (171 ms @ 8192)
+                                                        // was 20 (50/s): more redraws than the LVGL core can render, see fft_render()
 #define FFT_GRAPH_COLOR_HEX         0xFFFFFF
 #define FFT_GRAPH_GAP_FROM_PX       4                   // bars at least this wide get a 1 px gap on their right
 #define FFT_GRAPH_DB_MIN            0                   // dB SPL per bin, bottom of the chart, when the UI has no fft_min_sens_slider

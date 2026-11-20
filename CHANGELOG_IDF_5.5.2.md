@@ -249,6 +249,109 @@ first. Boot had room for the controller; 18 s of UI later the NimBLE host could 
 - `main.cpp` mem_info thread: one INFO line every 5 s with SRAM/PSRAM free and largest block
   (`heap: SRAM .. free / .. max block | PSRAM ..`). `EXAMPLE_SHOW_MEM_INFO = false` silences it.
 
+## Settings: Developer > "Enable Performance counter"
+- `settings.developer.performance_counter` (bool, default false) loaded/saved with the rest. The switch is mapped by its row
+  title like the others. `Settings::applyPerformanceCounter()` hides/shows LVGL's perf monitor label (created by LVGL at
+  display creation, `CONFIG_LV_USE_PERF_MONITOR`) and pauses/resumes its refresh timer; applied at `Settings::init()` and
+  on every switch change. `lv_sysmon_show_performance()` is not called again: in 9.2.2 it creates a second label and timer.
+- `settings_ui_bridge.h`: prototypes of `get/set_developer_performance_value()` (the regenerated `screens.c` calls the
+  getter, `actions.h` does not declare it: implicit declaration error in C with GCC 14).
+
+## Sonometer: FFT tab blocking the touch screen
+- `fft_render()` is incremental: only the rows between a column's old and new bar top are written (was a full rewrite of
+  the 96 KB A8 plane in PSRAM per spectrum, in the LVGL task). Returns the changed rectangle; `fft_timer_cb()` invalidates
+  that instead of the whole plot, so quiet parts of the spectrum are not redrawn or re-sent over QSPI.
+- `FFT_UPDATE_PERIOD_MS` 20 -> 50: 20 spectra/s instead of 50. 50 full-plot redraws per second exceeded what the LVGL core
+  renders, so it never got idle time to process touch. Also 2.5x less PSRAM churn from `fft_task` on core 0: the ESP32-S3
+  data cache (64 KB) is shared by both cores, so the FFT buffers in PSRAM evicted the fonts/images core 1 renders from.
+
+## Recorder / BLEMultiMedia: double-prefixed EEZ symbols (`Recorder_RemoteNow_Recorder_objects`)
+- `components/{Recorder,BLEMultiMedia,Sonometer}/update_eez.py` were copies of RemoteNow's with `APP_NAME = "RemoteNow"`.
+  Recorder and BLEMultiMedia run theirs at CMake configure: it prefixed their already-prefixed ui/ symbols with
+  `RemoteNow_`, then `dev/prefix_eez.py` added the component prefix again. Recorder.cpp / BLEMultiMedia.cpp no longer
+  compile. `APP_NAME` fixed in the three scripts (Sonometer's is not run by its CMakeLists, fixed anyway).
+- The ui/ files were not touched by hand. Their diff against HEAD is only that rename, so restoring them is safe:
+  `git checkout -- components/Recorder/ui components/BLEMultiMedia/ui`.
+
+### Performance counter never visible (fix)
+- Brookesia's `Display::begin()` replaces `disp->sys_layer` with its own system screen. LVGL had created the perf monitor
+  label on the original system layer at display creation, which is never drawn after that, so hiding/showing it did
+  nothing. `Settings::applyPerformanceCounter()` now re-parents the label onto the current system layer (once), marks it
+  floating, re-aligns it to `LV_USE_PERF_MONITOR_POS` and brings it to the foreground when shown.
+
+### `Bluetooth not started: internal RAM 54727 free / 40960 max block` at boot (fix)
+- `CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM` was on again: `.iram0.text` 0x2C183 (180 KB) instead of 0x1C113 (115 KB), and
+  internal heap start 0x3FCC3DF0 instead of 0x3FCB3738, about 67 KB less internal SRAM. Turned off in `sdkconfig`, and
+  written as explicitly off with the reason in `sdkconfig.defaults`. BLEMouse's start guard (72 KB free / 24 KB block)
+  is unchanged: it is what stopped this from becoming the earlier controller assert.
+
+### Internal SRAM moved to PSRAM so Bluetooth can start at runtime
+Link map before the change: `.dram0.bss` 41.9 KB, of which 24.2 KB is `Recorder.cpp` (FFT window 4 KB, FFT work buffer
+8 KB, file-name table 12 KB) and 5.9 KB the NimBLE host (`libbt.a`). Measured on the watch: 69 KB internal free at 96 s
+against the 72 KB the BLE start check asks for.
+- `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`: `EXT_RAM_BSS_ATTR` globals go to PSRAM, and IDF moves the `bt`
+  library's `.bss` there by itself (`bt_extram_bss` linker scheme).
+- `Recorder.cpp`: `s_fft_wind`, `s_fft_buf` and `refresh_file_list()`'s `names` tagged `EXT_RAM_BSS_ATTR` (24 KB).
+- `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 8192 -> 1024: plain `malloc`/`new` above 1 KB (Brookesia, C++ containers, audio
+  player, cJSON documents) goes to PSRAM first. Code that needs internal or DMA memory asks for it explicitly and is
+  unaffected; LVGL has its own allocator.
+- `main.cpp` mem_info thread stack (4 KB) in PSRAM (`stack_in_ext`): it never touches flash or sleeps.
+- `BLEMouse.cpp`: logs the real cost of starting the stack once the host has synced
+  (`BLE up: internal RAM A -> B free, stack took N B`). The 72 KB / 24 KB start check is an estimate; set it to the
+  measured cost plus a margin.
+
+## Status bar, battery percentage, Upgrade sub-menu, firmware update check
+
+### Status bar (top-right)
+- Only 3 icons showed: the icon area was 30 % of 410 px minus the 60 px corner offset (about 63 px), and Brookesia hides
+  an icon that does not fit its area when it is added (`StatusBarIcon::updateByNewData`). `main/dark/status_bar_data.hpp`:
+  icon area 62 % (room for 5 icons + the battery percentage). It overlaps the clock area; both are transparent.
+- `brookesia_core` StatusBar: new public `getAreaObject(index)` (read access to the area containers).
+- `Settings::layoutStatusBar()`, run on `LV_EVENT_LAYOUT_CHANGED` of the icon and clock areas: once more than
+  `STATUS_ICONS_BEFORE_SHIFT` (3) icons are visible the clock area moves left (`translate_x`) by the width of the extra
+  icons, and in any case far enough to keep 8 px from the icon group (covers the percentage text); never further left
+  than 40 px from the edge. Written only when the value changes, so the layout pass it triggers settles.
+- Wi-Fi icon (`Settings::refreshWifiIcon()`): hidden unless Wi-Fi or ESP-NOW is enabled; then "connected" (3 bars) when
+  the station has an IP, else the "Wi-Fi off" glyph. Updated by both switches and every status tick.
+  `BLEMouse::refreshStatusIcon()` no longer drives the Wi-Fi icon with the BLE link (the Bluetooth icon does that).
+- Battery > "Display percentage": `settings.battery.show_percentage`, getter/setter `get/set_battery_perc_text_value()`
+  (prototypes in `settings_ui_bridge.h`, not in `actions.h`). Stylesheet `enable_battery_label = 1`; the label is shown
+  or hidden with `showBatteryPercent()` / `hideBatteryPercent()`, text refreshed by the status timer.
+
+### Settings UI (`components/Settings/ui/screens.c|h`, hand-written: the Settings EEZ project has no screens)
+- `create_button(parent, text, event_cb, user_id)`: a menu row (`lv_menu_cont`) holding a button with the previous
+  styling (content size, label centred, Montserrat 24); `user_id` is the button's user data (a `buttons_t`). The Upgrade
+  and About buttons use it; they used to be created straight in the menu section, outside any row.
+
+### Firmware update check (`components/Settings/SettingsUpgrade.cpp`, new)
+- `settings.upgrade.src_url`, default `https://api.slimyredstone.net/code/s3-watch/version`; written to the file at boot
+  when missing. `loadFromSd()` reads into a 4 KB heap buffer (the file passed 1 KB; it was a 1 KB stack array on the
+  main task).
+- `Settings::getVersion()` / `getVersionText()`: hard-coded `FW_VERSION` (1.0.0) in `Settings.hpp`. The About page shows
+  it instead of the build time.
+- `Settings::fetchLatestVersion()`: HTTPS GET (`esp_http_client`, CA bundle, redirects followed), parses
+  `{"last":{"t":"v1.2.0","n":[1,2,0]},"url":"..."}` (`n` first, `t` as fallback).
+- "Check for updates" -> `Settings::checkForUpdates()`: no Wi-Fi connection -> message asking to enable Wi-Fi and connect
+  to a router. Then, on a pthread with its stack in PSRAM: up to date -> message; newer and no SD card -> message that
+  the SD card is mandatory, nothing downloaded; newer -> download to `/sdcard/.temp/<file name from the URL>` through a
+  `.part` file, progress in the message box, size checked against Content-Length. Installing is not implemented.
+- `Settings::isWifiConnected()` checks `esp_netif_get_nr_of_ifs()` first: nothing in the project starts Wi-Fi yet, and
+  the handle lookup goes through the lwIP thread, which would hang if lwIP was never initialised.
+- `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` (sdkconfig + defaults): TLS buffers in PSRAM. Settings `REQUIRES` gains
+  `esp_http_client esp-tls mbedtls esp_netif pthread`.
+- Partition table: unchanged. `partitions.csv` already has `otadata` + `ota_0` + `ota_1` (6 MB each, app is 3.1 MB).
+
+### Status bar follow-up, Upgrade button width
+- Battery percentage text at half the clock's size: the enabled Montserrat font whose line height is closest to half
+  the clock font's (`half_size_font()` in Settings.cpp; Montserrat 14 with the current stylesheet).
+- Battery icon first in the icon area, percentage right after it: [battery][%][Wi-Fi][SD][BT]. Brookesia builds
+  [Wi-Fi][%][battery]; `applyBatteryPercentage()` re-orders once (`lv_obj_move_to_index`).
+- `create_button()`: the label kept `lv_obj_set_pos(label, -1, 0)` from the old block. LVGL 9.2 leaves a centred child
+  with x != 0 out of its parent's `LV_SIZE_CONTENT` width (`calc_content_width()`, circular-dependency guard), so the
+  button was only as wide as its padding (about 3 letters). The offset is gone.
+- `SettingsUpgrade.cpp`: two error messages printed the full `.part` path (up to 199 chars) into a 128-byte buffer,
+  rejected by `-Werror=format-truncation`; they print `.temp/<file name>` now.
+
 ## 5. What to do now
 
 1. `idf.py build` (full build, link untested by me).

@@ -6,10 +6,16 @@
 #include "Settings.hpp"
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <cstdlib>
 #include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
 #include "cJSON.h"
 #include "esp_timer.h"
+#if LV_USE_PERF_MONITOR
+#include "src/display/lv_display_private.h"            // perf_label / perf timer: LVGL 9.2 has no public toggle
+#include "src/others/sysmon/lv_sysmon_private.h"
+#endif
 
 #ifdef ESP_UTILS_LOG_TAG
 #   undef ESP_UTILS_LOG_TAG
@@ -66,6 +72,8 @@ static constexpr const char *ROW_VOLUME          = "Volume";
 static constexpr const char *ROW_WIFI            = "Enable WiFi";
 static constexpr const char *ROW_BLUETOOTH       = "Enable Bluetooth";
 static constexpr const char *ROW_ESPNOW          = "Enable ESP-Now";
+static constexpr const char *ROW_PERF_COUNTER    = "Enable Performance counter";
+static constexpr const char *ROW_BATTERY_PERCENT = "Display percentage";
 
 extern "C" {
     #include "settings_ui_bridge.h"   // prototypes missing from generated actions.h
@@ -98,7 +106,7 @@ extern "C" {
     void set_vibrations_value(bool value)      { Settings::cfg.audio.vibrations = value; }
 
     bool get_wifi_value(void)                  { return Settings::cfg.wifi.enabled; }
-    void set_wifi_value(bool value)            { Settings::cfg.wifi.enabled = value; }
+    void set_wifi_value(bool value)            { Settings::cfg.wifi.enabled = value; Settings::refreshWifiIcon(); }
 
     bool get_bluetooth_value(void)             { return Settings::cfg.bluetooth.enabled; }
     void set_bluetooth_value(bool value)       {
@@ -110,7 +118,21 @@ extern "C" {
     void set_upgrade_value(bool value)         { Settings::cfg.upgrade.enabled = value; }
 
     bool get_espnow_value(void)                { return Settings::cfg.espnow.enabled; }
-    void set_espnow_value(bool value)          { Settings::cfg.espnow.enabled = value; }
+    void set_espnow_value(bool value)          { Settings::cfg.espnow.enabled = value; Settings::refreshWifiIcon(); }
+
+    bool get_battery_perc_text_value(void)     { return Settings::cfg.battery.show_percentage; }
+    void set_battery_perc_text_value(bool v)   {
+        Settings::cfg.battery.show_percentage = v;
+        Settings::applyBatteryPercentage();
+    }
+
+    bool get_developer_performance_value(void)                { return Settings::cfg.developer.performance_counter; }
+    void set_developer_performance_value(bool value)          {
+        Settings::cfg.developer.performance_counter = value;
+        Settings::applyPerformanceCounter();
+    }
+
+
 
     const char *get_version_value(const char* prefix, const char *suffix) {
         // static: the generated UI keeps the returned pointer (label text),
@@ -119,11 +141,8 @@ extern "C" {
         if (prefix == NULL) prefix = "";
         if (suffix == NULL) suffix = "";
 
-        if (strlen(prefix) + strlen(suffix) > (sizeof(txt)/2)) return __TIME__;
-        char version_txt[16] = {0};
-
-        snprintf(version_txt, sizeof(version_txt), "%s", __TIME__);
-        snprintf(txt, sizeof(txt), "%s%s%s", prefix, version_txt, suffix);
+        if (strlen(prefix) + strlen(suffix) > (sizeof(txt)/2)) return Settings::getVersionText();
+        snprintf(txt, sizeof(txt), "%s%s%s", prefix, Settings::getVersionText(), suffix);
         return txt;
     }
     void set_version_value(const char * value) {
@@ -154,6 +173,8 @@ extern "C" {
                 }
             }
             else if (strcmp(name, ROW_ESPNOW) == 0)          set_espnow_value(on);
+            else if (strcmp(name, ROW_PERF_COUNTER) == 0)    set_developer_performance_value(on);
+            else if (strcmp(name, ROW_BATTERY_PERCENT) == 0) set_battery_perc_text_value(on);
             else { ESP_UTILS_LOGW("switch '%s' not mapped", name); return; }
             ESP_UTILS_LOGI("switch '%s' -> %d", name, (int)on);
             Settings::saveLater();
@@ -165,6 +186,7 @@ extern "C" {
         switch (type) {
             case BUTTON_CHECK_UPDATES:
                 ESP_UTILS_LOGI("Check updates button pressed");
+                Settings::checkForUpdates();
                 break;
             case BUTTON_TEST:
                 ESP_UTILS_LOGI("Test button pressed");
@@ -282,6 +304,8 @@ Settings::BluetoothHandler Settings::_bt_handler = nullptr;
 lv_timer_t *Settings::_save_timer = nullptr;
 static bool s_sd_mounted    = false;
 static bool s_load_attempted = false;
+static bool s_save_after_load = false;   // the file lacks a key with a default worth writing (upgrade.src_url)
+static constexpr size_t CFG_FILE_MAX = 4096;
 
 // ---------------------------------------------------------------------------
 // SD-backed config load/save.
@@ -295,7 +319,7 @@ bool Settings::ensureLoaded()
     // Best-effort: failures mean defaults / no persistence.
     if (bsp_sdcard_mount() == ESP_OK) {
         s_sd_mounted = true;
-        if (!loadFromSd()) {
+        if (!loadFromSd() || s_save_after_load) {
             saveToSd();
         }
     } else {
@@ -310,12 +334,18 @@ bool Settings::loadFromSd()
     if (f == nullptr) {
         return false;
     }
-    char buf[1024] = {};
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    // Heap, not stack: this runs on the main task (3.5 KB stack) and the file
+    // is past 1 KB since the upgrade URL was added.
+    char *buf = (char *)calloc(1, CFG_FILE_MAX);
+    if (buf == nullptr) {
+        fclose(f);
+        return false;
+    }
+    size_t n = fread(buf, 1, CFG_FILE_MAX - 1, f);
     fclose(f);
-    if (n == 0) return false;
-
-    cJSON *j = cJSON_Parse(buf);
+    if (n == CFG_FILE_MAX - 1) ESP_UTILS_LOGW("%s is larger than %u B, truncated", CFG_PATH, (unsigned)CFG_FILE_MAX);
+    cJSON *j = (n > 0) ? cJSON_Parse(buf) : nullptr;
+    free(buf);
     if (j == nullptr) return false;
 
     // Items returned by cJSON_GetObjectItem() are owned by `j`; only
@@ -345,8 +375,22 @@ bool Settings::loadFromSd()
         if (cJSON_IsObject(wifi)) cfg.wifi.enabled = json_bool(wifi, "enabled", d.wifi.enabled);
         cJSON *now = cJSON_GetObjectItem(root, "espnow");
         if (cJSON_IsObject(now))  cfg.espnow.enabled = json_bool(now, "enabled", d.espnow.enabled);
+        cJSON *bat = cJSON_GetObjectItem(root, "battery");
+        if (cJSON_IsObject(bat))  cfg.battery.show_percentage =
+                                      json_bool(bat, "show_percentage", d.battery.show_percentage);
         cJSON *up = cJSON_GetObjectItem(root, "upgrade");
         if (cJSON_IsObject(up))   cfg.upgrade.enabled = json_bool(up, "enabled", d.upgrade.enabled);
+        cJSON *src = cJSON_GetObjectItem(up, "src_url");
+        if (cJSON_IsString(src) && src->valuestring[0] != '\0' &&
+            strlen(src->valuestring) < sizeof(cfg.upgrade.src_url)) {
+            strcpy(cfg.upgrade.src_url, src->valuestring);
+        } else {
+            strcpy(cfg.upgrade.src_url, d.upgrade.src_url);
+            s_save_after_load = true;                  // write the default so the key shows up in the file
+        }
+        cJSON *dev = cJSON_GetObjectItem(root, "developer");
+        if (cJSON_IsObject(dev))  cfg.developer.performance_counter =
+                                      json_bool(dev, "performance_counter", d.developer.performance_counter);
     }
     cJSON_Delete(j);
     ESP_UTILS_LOGI("Settings loaded: brightness=%d dim=%d btn_wake=%d no_sleep_chg=%d ls_bri=%d ls=%ds ds=%ds "
@@ -385,7 +429,12 @@ bool Settings::saveToSd()
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "bluetooth"), "enabled", cfg.bluetooth.enabled);
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "wifi"),      "enabled", cfg.wifi.enabled);
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "espnow"),    "enabled", cfg.espnow.enabled);
-    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "upgrade"),   "enabled", cfg.upgrade.enabled);
+    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "battery"),   "show_percentage", cfg.battery.show_percentage);
+    cJSON *up = cJSON_AddObjectToObject(root, "upgrade");
+    cJSON_AddBoolToObject(up,   "enabled", cfg.upgrade.enabled);
+    cJSON_AddStringToObject(up, "src_url", cfg.upgrade.src_url);
+    cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "developer"), "performance_counter",
+                          cfg.developer.performance_counter);
 
     char *out = cJSON_Print(j);  // pretty-printed
     cJSON_Delete(j);
@@ -487,6 +536,48 @@ bool Settings::applyBluetooth()
         return false;
     }
     return _bt_handler(cfg.bluetooth.enabled);
+}
+
+void Settings::applyPerformanceCounter()
+{
+#if LV_USE_PERF_MONITOR
+    // lv_sysmon_show_performance() creates a new label + timer on every call
+    // (LVGL 9.2.2), so it must not be called again: toggle the existing one.
+    lv_display_t *disp = lv_display_get_default();
+    if (disp == nullptr || disp->perf_label == nullptr) return;
+
+    // LVGL creates the label on the display's system layer when the display
+    // is created. Brookesia's Display::begin() then replaces disp->sys_layer
+    // with its own system screen (status bar, gestures), so the label was left
+    // on a layer that is never drawn again. Move it onto the current one.
+    lv_obj_t *sys = lv_display_get_layer_sys(disp);
+    if (sys != nullptr && lv_obj_get_parent(disp->perf_label) != sys) {
+        lv_obj_set_parent(disp->perf_label, sys);
+        lv_obj_add_flag(disp->perf_label, LV_OBJ_FLAG_FLOATING);           // out of any layout / scrolling
+        lv_obj_align(disp->perf_label, LV_USE_PERF_MONITOR_POS, 0, 0);
+    }
+
+    const bool on = cfg.developer.performance_counter;
+    if (on) {
+        lv_obj_remove_flag(disp->perf_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(disp->perf_label);                           // above the status bar & co.
+    } else {
+        lv_obj_add_flag(disp->perf_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (disp->perf_sysmon_backend.timer != nullptr) {
+        if (on) lv_timer_resume(disp->perf_sysmon_backend.timer);
+        else    lv_timer_pause(disp->perf_sysmon_backend.timer);
+    }
+#else
+    if (cfg.developer.performance_counter) {
+        ESP_UTILS_LOGW("Performance counter: CONFIG_LV_USE_PERF_MONITOR is off in menuconfig");
+    }
+#endif
+}
+
+bool Settings::isSdMounted()
+{
+    return s_sd_mounted;
 }
 
 bool Settings::isCharging()
@@ -625,6 +716,19 @@ bool Settings::init()
         }
     }
 
+    // Performance counter visibility from the saved config (hidden by default).
+    applyPerformanceCounter();
+
+    // Status bar: Wi-Fi icon visibility, battery percentage, clock position.
+    refreshWifiIcon();
+    applyBatteryPercentage();
+    if (auto *bar = statusBar()) {
+        for (uint8_t area : {STATUS_ICON_AREA, STATUS_CLOCK_AREA}) {
+            lv_obj_t *obj = bar->getAreaObject(area);
+            if (obj != nullptr) lv_obj_add_event_cb(obj, &Settings::onStatusBarLayout, LV_EVENT_LAYOUT_CHANGED, nullptr);
+        }
+    }
+
     // Long-lived LV timer that pushes battery state to the status bar.
     if (_status_timer == nullptr) {
         _status_timer = lv_timer_create(&Settings::onStatusTimer, STATUS_PERIOD_MS, this);
@@ -700,6 +804,7 @@ void Settings::onStatusTimer(lv_timer_t *t)
 
     // Catches a BLE state change that arrived before the status bar existed.
     syncBluetoothIcon();
+    refreshWifiIcon();
 
     if (!s_pmu_inited) return;
 
@@ -719,6 +824,186 @@ void Settings::onStatusTimer(lv_timer_t *t)
     if (show_pct < 0)   show_pct = 0;
     if (show_pct > 100) show_pct = 100;
     status_bar->setBatteryPercent(charging, show_pct);
+}
+
+// ---------------------------------------------------------------------------
+// Status bar: Wi-Fi icon, battery percentage, clock position
+// ---------------------------------------------------------------------------
+
+static int s_wifi_icon_state = -2;                      // last state pushed, -1 = hidden, -2 = never set
+static constexpr int32_t CLOCK_GAP_PX        = 8;       // minimum space between the clock and the icons
+static constexpr int32_t CLOCK_LEFT_LIMIT_PX = 40;      // the clock never goes further left (round corner)
+
+systems::phone::StatusBar *Settings::statusBar()
+{
+    if (_instance == nullptr) return nullptr;
+    auto *phone = _instance->getSystem();
+    if (phone == nullptr) return nullptr;
+    return phone->getDisplay().getStatusBar();
+}
+
+void Settings::refreshWifiIcon()
+{
+    auto *bar = statusBar();
+    if (bar == nullptr) return;
+    using WifiState = systems::phone::StatusBar::WifiState;
+    int state = -1;                                     // hidden: neither Wi-Fi nor ESP-NOW enabled
+    if (cfg.wifi.enabled || cfg.espnow.enabled) {
+        state = static_cast<int>(isWifiConnected() ? WifiState::SIGNAL_3 : WifiState::DISCONNECTED);
+    }
+    if (state == s_wifi_icon_state) return;
+    if (bar->setWifiIconState(state)) s_wifi_icon_state = state;
+}
+
+// Enabled Montserrat font whose line height is closest to half of ref's.
+static const lv_font_t *half_size_font(const lv_font_t *ref)
+{
+    static const lv_font_t *const fonts[] = {
+#if LV_FONT_MONTSERRAT_8
+        &lv_font_montserrat_8,
+#endif
+#if LV_FONT_MONTSERRAT_10
+        &lv_font_montserrat_10,
+#endif
+#if LV_FONT_MONTSERRAT_12
+        &lv_font_montserrat_12,
+#endif
+#if LV_FONT_MONTSERRAT_14
+        &lv_font_montserrat_14,
+#endif
+#if LV_FONT_MONTSERRAT_16
+        &lv_font_montserrat_16,
+#endif
+#if LV_FONT_MONTSERRAT_18
+        &lv_font_montserrat_18,
+#endif
+#if LV_FONT_MONTSERRAT_20
+        &lv_font_montserrat_20,
+#endif
+#if LV_FONT_MONTSERRAT_22
+        &lv_font_montserrat_22,
+#endif
+#if LV_FONT_MONTSERRAT_24
+        &lv_font_montserrat_24,
+#endif
+        LV_FONT_DEFAULT,
+    };
+    const int32_t target = ref->line_height / 2;
+    const lv_font_t *best = ref;
+    int32_t best_diff = INT32_MAX;
+    for (const lv_font_t *f : fonts) {
+        const int32_t diff = std::abs(f->line_height - target);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = f;
+        }
+    }
+    return best;
+}
+
+// Icon area, left to right as Brookesia builds it: [Wi-Fi][%][battery], then
+// the SD and Bluetooth icons Settings adds. Put the battery first and its
+// percentage right after it: [battery][%][Wi-Fi][SD][BT]. The label is the
+// only text in the area and Brookesia creates the battery icon right after it
+// (StatusBar::beginBattery()), which is how the icon is found. Once is enough:
+// icons added later are appended on the right.
+static bool s_icons_arranged = false;
+
+void Settings::applyBatteryPercentage()
+{
+    auto *bar = statusBar();
+    if (bar == nullptr) return;
+    if (cfg.battery.show_percentage) bar->showBatteryPercent();
+    else                             bar->hideBatteryPercent();
+
+    lv_obj_t *icons = bar->getAreaObject(STATUS_ICON_AREA);
+    if (icons == nullptr) return;
+    lv_obj_t *label = nullptr;
+    int32_t label_idx = -1;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(icons); i++) {
+        lv_obj_t *child = lv_obj_get_child(icons, (int32_t)i);
+        if (lv_obj_check_type(child, &lv_label_class)) {
+            label = child;
+            label_idx = (int32_t)i;
+            break;
+        }
+    }
+    if (label == nullptr) {
+        ESP_UTILS_LOGW("Status bar has no battery label (stylesheet enable_battery_label = 0?)");
+        return;
+    }
+
+    // Percentage text at half the clock's size (the clock uses the bar's font).
+    lv_obj_t *clock_area = bar->getAreaObject(STATUS_CLOCK_AREA);
+    lv_obj_t *clock      = (clock_area != nullptr) ? lv_obj_get_child(clock_area, 0) : nullptr;
+    lv_obj_t *clock_text = (clock != nullptr) ? lv_obj_get_child(clock, 0) : nullptr;
+    if (clock_text != nullptr) {
+        lv_obj_set_style_text_font(label, half_size_font(lv_obj_get_style_text_font(clock_text, LV_PART_MAIN)),
+                                   LV_PART_MAIN);
+    }
+
+    if (!s_icons_arranged) {
+        lv_obj_t *battery = lv_obj_get_child(icons, label_idx + 1);
+        if (battery != nullptr) {
+            lv_obj_move_to_index(battery, 0);
+            lv_obj_move_to_index(label, 1);
+            s_icons_arranged = true;
+        }
+    }
+}
+
+void Settings::onStatusBarLayout(lv_event_t * /*e*/)
+{
+    layoutStatusBar();
+}
+
+// The icon area is right-aligned (flex END, last child rightmost) and is wide
+// enough for 5 icons, so it overlaps the clock area. The clock area is moved
+// with translate_x, which does not touch the icon layout. Only written when
+// the value changes: setting it re-runs the clock area's layout, whose
+// LV_EVENT_LAYOUT_CHANGED calls this again, and must then find nothing to do.
+void Settings::layoutStatusBar()
+{
+    auto *bar = statusBar();
+    if (bar == nullptr) return;
+    lv_obj_t *icons      = bar->getAreaObject(STATUS_ICON_AREA);
+    lv_obj_t *clock_area = bar->getAreaObject(STATUS_CLOCK_AREA);
+    if (icons == nullptr || clock_area == nullptr) return;
+    lv_obj_t *clock = lv_obj_get_child(clock_area, 0);
+    if (clock == nullptr || lv_obj_has_flag(clock, LV_OBJ_FLAG_HIDDEN)) return;
+
+    // Visible items, right to left: the group's width, and the width taken by
+    // the icons beyond the first STATUS_ICONS_BEFORE_SHIFT (the % label is not an icon).
+    const int32_t pad = lv_obj_get_style_pad_column(icons, LV_PART_MAIN);
+    int32_t group = 0;
+    int32_t extra = 0;
+    int     items = 0;
+    int     icon_count = 0;
+    for (int32_t i = (int32_t)lv_obj_get_child_count(icons) - 1; i >= 0; i--) {
+        lv_obj_t *child = lv_obj_get_child(icons, i);
+        if (child == nullptr || lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) continue;
+        const int32_t w = lv_obj_get_width(child) + ((items > 0) ? pad : 0);
+        group += w;
+        items++;
+        if (!lv_obj_check_type(child, &lv_label_class) && ++icon_count > STATUS_ICONS_BEFORE_SHIFT) extra += w;
+    }
+
+    lv_area_t icons_area;
+    lv_obj_get_coords(icons, &icons_area);
+    const int32_t icons_left = icons_area.x2 - lv_obj_get_style_pad_right(icons, LV_PART_MAIN) - group + 1;
+
+    // Clock position without the current shift.
+    const int32_t tx_now = lv_obj_get_style_translate_x(clock_area, LV_PART_MAIN);
+    lv_area_t clock_coords;
+    lv_obj_get_coords(clock, &clock_coords);
+    const int32_t clock_x1 = clock_coords.x1 - tx_now;
+    const int32_t clock_x2 = clock_coords.x2 - tx_now;
+
+    int32_t shift = extra;                                          // > 3 icons: room for each extra one
+    if (items > 0) shift = std::max(shift, clock_x2 + CLOCK_GAP_PX - icons_left + 1);   // never touch the icons
+    shift = std::max<int32_t>(shift, 0);
+    shift = std::min<int32_t>(shift, std::max<int32_t>(clock_x1 - CLOCK_LEFT_LIMIT_PX, 0));
+    if (tx_now != -shift) lv_obj_set_style_translate_x(clock_area, -shift, LV_PART_MAIN);
 }
 
 // ---------------------------------------------------------------------------

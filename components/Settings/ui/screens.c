@@ -86,6 +86,29 @@ static lv_obj_t *create_text( lv_obj_t *parent, const char *icon, const char *tx
 	return obj;
 }
 
+// Menu row holding one clickable button. event_cb gets LV_EVENT_CLICKED, the
+// button's user data is user_id (e.g. a buttons_t value), so one callback can
+// serve several buttons. Returns the row, like create_slider() / create_switch().
+static lv_obj_t *create_button( lv_obj_t *parent, const char *txt, lv_event_cb_t event_cb, int32_t user_id) {
+	lv_obj_t *obj = lv_menu_cont_create(parent);
+
+	lv_obj_t *button = lv_btn_create(obj);
+	lv_obj_set_size(button, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+	lv_obj_add_event_cb(button, event_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_set_user_data(button, (void *)(intptr_t)user_id);
+	{
+		lv_obj_t *label = lv_label_create(button);
+		// x must stay 0: LVGL leaves a centred child with x != 0 out of its
+		// parent's LV_SIZE_CONTENT width, and the button shrank to its padding.
+		lv_label_set_text(label, txt);
+		lv_obj_set_size(label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+		lv_obj_set_style_align(label, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+		lv_obj_set_style_text_font(label, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
+	}
+
+	return obj;
+}
+
 
 
 
@@ -122,6 +145,7 @@ void Settings_create_screen_main() {
             lv_obj_t *sub_battery_page = lv_menu_page_create(menu, NULL);
             lv_obj_t *sub_sdcard_page = lv_menu_page_create(menu, NULL);
             lv_obj_t *sub_about_page = lv_menu_page_create(menu, NULL);
+            lv_obj_t *sub_dev_page = lv_menu_page_create(menu, NULL);
 
 
             //  Root Settings page
@@ -139,6 +163,7 @@ void Settings_create_screen_main() {
                 ADD_SUBMENU("Battery", sub_battery_page, (const char*)LV_SYMBOL_BATTERY_FULL)
                 ADD_SUBMENU("SD Card", sub_sdcard_page, (const char*)LV_SYMBOL_SD_CARD)
                 ADD_SUBMENU("About", sub_about_page, (const char*)LV_SYMBOL_HOME)
+                ADD_SUBMENU("Developer", sub_dev_page, (const char*)LV_SYMBOL_USB)
 
                 lv_menu_set_sidebar_page(menu, Settings_root_page);
                 lv_obj_send_event( 
@@ -206,20 +231,7 @@ void Settings_create_screen_main() {
                 SET_SUBMENU_SEPARATOR( sub_upgrade_page )
                 section = lv_menu_section_create( sub_upgrade_page );
                 create_text(section, LV_SYMBOL_FILE, "Upgrades", LV_MENU_ITEM_BUILDER_VARIANT_1);
-                {
-                    lv_obj_t *button = lv_btn_create(section);
-                    lv_obj_set_size(button, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-                    lv_obj_add_event_cb(button, action_button_pressed, LV_EVENT_CLICKED, NULL);
-                    lv_obj_set_user_data(button, (void *)BUTTON_CHECK_UPDATES);
-                    {
-                        lv_obj_t *obj = lv_label_create(button);
-                        lv_obj_set_pos(obj, -1, 0);
-                        lv_label_set_text(obj, "Check for updates");
-                        lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-                        lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_set_style_text_font(obj, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
-                    }
-                }
+                create_button(section, "Check for updates", action_button_pressed, BUTTON_CHECK_UPDATES);
             }
 
             //  Battery Sub-Menu
@@ -228,6 +240,7 @@ void Settings_create_screen_main() {
                 SET_SUBMENU_SEPARATOR( sub_battery_page )
                 section = lv_menu_section_create( sub_battery_page );
                 create_text(section, LV_SYMBOL_BATTERY_FULL, "Battery", LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_switch(section, LV_SYMBOL_IMAGE, "Display percentage", get_battery_perc_text_value());
             }
 
             //  SD Card Sub-Menu
@@ -246,21 +259,15 @@ void Settings_create_screen_main() {
                 create_text(section, NULL, "About", LV_MENU_ITEM_BUILDER_VARIANT_1);
                 create_text(section, NULL, get_version_value("Current: ", NULL), LV_MENU_ITEM_BUILDER_VARIANT_1);
                 create_text(section, NULL, "Created by SlimyRedstone", LV_MENU_ITEM_BUILDER_VARIANT_1);
-                {
-                    lv_obj_t *button = lv_btn_create(section);
-                    lv_obj_set_size(button, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-                    lv_obj_add_event_cb(button, action_button_pressed, LV_EVENT_CLICKED, NULL);
-                    lv_obj_set_user_data(button, (void *)BUTTON_TEST);
-                    {
-                        // record_button_label
-                        lv_obj_t *obj = lv_label_create(button);
-                        lv_obj_set_pos(obj, -1, 0);
-                        lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-                        lv_label_set_text(obj, "Test");
-                        lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-                        lv_obj_set_style_text_font(obj, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
-                    }
-                }
+                create_button(section, "Test", action_button_pressed, BUTTON_TEST);
+            }
+            //  Developer Sub-Menu
+            {
+                SET_SUBMENU_PADDING( sub_dev_page )
+                SET_SUBMENU_SEPARATOR( sub_dev_page )
+                section = lv_menu_section_create( sub_dev_page );
+                create_text(section, LV_SYMBOL_USB, "Developer Options", LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_switch(section, LV_SYMBOL_WARNING, "Enable Performance counter", get_developer_performance_value());
             }
         }
     }

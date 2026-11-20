@@ -99,6 +99,15 @@ public:
     bool removeIcon(int id);
     bool setIconState(int id, int state) const;
 
+    /**
+     * @brief Area container (index 0 .. area.num - 1), nullptr if out of range or not begun.
+     *        Lets the app adjust the layout (e.g. move the clock when the icon area fills up).
+     */
+    lv_obj_t *getAreaObject(uint8_t area_index) const
+    {
+        return (area_index < _area_objs.size()) ? _area_objs[area_index].get() : nullptr;
+    }
+
     // Battery
     bool setBatteryPercent(bool charge_flag, int percent) const;
     bool showBatteryPercent(void) const;

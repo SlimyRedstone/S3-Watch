@@ -82,7 +82,7 @@ static int32_t s_fft_img_w = 0;
 static int32_t s_fft_img_h = 0;
 static float *s_fft_view = nullptr;                     // shown spectrum, one dB value per column (LVGL task)
 static uint32_t s_fft_view_cols = 0;                    // columns of the shown spectrum (LVGL task)
-static int32_t *s_fft_top = nullptr;                    // first lit row of each pixel column (LVGL task)
+static int32_t *s_fft_top = nullptr;                    // first lit row of each pixel column as drawn in the mask now (LVGL task)
 static char s_fft_label_text[FFT_SCALE_LABELS_MAX][16]; // fft_frequency_scale labels, computed from the log axis
 static const char *s_fft_labels[FFT_SCALE_LABELS_MAX + 1];
 static int32_t s_fft_db_min = FFT_GRAPH_DB_MIN;         // dB, bottom of fft_graph, from fft_min_sens_slider (LVGL task)
@@ -354,6 +354,7 @@ static bool fft_image_setup(int32_t w, int32_t h) {
     const uint16_t color = lv_color_to_u16(lv_color_hex(FFT_GRAPH_COLOR_HEX));
     for (size_t i = 0; i < px; i++) rgb[i] = color;
     memset(s_fft_img_buf + px * 2, 0, px);
+    for (int32_t x = 0; x < w; x++) s_fft_top[x] = h;                     // mask empty: no column lit
 
     memset(&s_fft_img, 0, sizeof(s_fft_img));
     s_fft_img.header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -370,29 +371,52 @@ static bool fft_image_setup(int32_t w, int32_t h) {
 @brief Renders the shown spectrum into the image's A8 plane: column c spans [c * w / cols, (c + 1) * w / cols)
 @note Bar height: level within [s_fft_db_min, s_fft_db_max] (sensitivity sliders), clipped to the plot
 @note Bars at least FFT_GRAPH_GAP_FROM_PX wide keep their last pixel column empty, as a gap
+@note Incremental: s_fft_top is the first lit row of each pixel column as drawn now, only the rows between a column's old
+      and new top are written. Rewriting the whole plane cost about 96 KB of PSRAM writes per spectrum (384 x 252 plot),
+      on the LVGL core, and evicted the shared data cache the renderer reads fonts and images through
+@param dirty when not null, receives the changed rectangle, in image coordinates
+@return true if any pixel changed
 */
-static void fft_render(void) {
+static bool fft_render(lv_area_t *dirty) {
     const int32_t w = s_fft_img_w;
     const int32_t h = s_fft_img_h;
     const int32_t cols = (int32_t)s_fft_view_cols;
-    if (s_fft_img_buf == nullptr || cols <= 0 || cols > w) return;
+    if (s_fft_img_buf == nullptr || s_fft_top == nullptr || cols <= 0 || cols > w) return false;
 
     const float db_lo = (float)s_fft_db_min;
     const float db_span = std::max((float)(s_fft_db_max - s_fft_db_min), 1.0f);   // min >= max: 1 dB range
     const bool gaps = w / cols >= FFT_GRAPH_GAP_FROM_PX;
+    uint8_t *mask = s_fft_img_buf + (size_t)w * (size_t)h * 2;
+    int32_t dx1 = w, dx2 = -1, dy1 = h, dy2 = -1;
     for (int32_t c = 0; c < cols; c++) {
         const int32_t x0 = c * w / cols;
         const int32_t x1 = (c + 1) * w / cols;
         const float level = std::clamp((s_fft_view[c] - db_lo) / db_span, 0.0f, 1.0f);
-        const int32_t bar_h = (int32_t)lroundf(level * (float)h);
-        for (int32_t x = x0; x < x1; x++) s_fft_top[x] = (gaps && x == x1 - 1) ? h : h - bar_h;
+        const int32_t bar_top = h - (int32_t)lroundf(level * (float)h);
+        for (int32_t x = x0; x < x1; x++) {
+            const int32_t top = (gaps && x == x1 - 1) ? h : bar_top;
+            const int32_t old = s_fft_top[x];
+            if (top == old) continue;
+            const int32_t y0 = std::min(top, old);
+            const int32_t y1 = std::max(top, old);
+            const uint8_t v = (top < old) ? 0xFF : 0x00;                    // bar grew: light [top, old), shrank: clear [old, top)
+            uint8_t *p = mask + (size_t)y0 * (size_t)w + (size_t)x;
+            for (int32_t y = y0; y < y1; y++, p += w) *p = v;
+            s_fft_top[x] = top;
+            dx1 = std::min(dx1, x);
+            dx2 = std::max(dx2, x);
+            dy1 = std::min(dy1, y0);
+            dy2 = std::max(dy2, y1 - 1);
+        }
     }
-
-    uint8_t *mask = s_fft_img_buf + (size_t)w * (size_t)h * 2;
-    for (int32_t y = 0; y < h; y++) {
-        uint8_t *row = mask + (size_t)y * (size_t)w;
-        for (int32_t x = 0; x < w; x++) row[x] = (y >= s_fft_top[x]) ? 0xFF : 0x00;
+    if (dx2 < 0) return false;
+    if (dirty != nullptr) {
+        dirty->x1 = dx1;
+        dirty->y1 = dy1;
+        dirty->x2 = dx2;
+        dirty->y2 = dy2;
     }
+    return true;
 }
 
 /*
@@ -444,7 +468,7 @@ static void fft_apply_bars(uint32_t bars) {
     s_fft_view_cols = fft_columns(bars, s_fft_plot_w);
     if (s_fft_view != nullptr) {
         for (uint32_t c = 0; c < s_fft_view_cols; c++) s_fft_view[c] = FFT_DB_EMPTY;
-        fft_render();
+        fft_render(nullptr);
     }
     lv_obj_t *chart = Sonometer_objects.fft_graph;
     if (chart != nullptr) lv_obj_invalidate(chart);
@@ -462,7 +486,7 @@ static void fft_apply_range(void) {
     lv_obj_t *chart = Sonometer_objects.fft_graph;
     if (chart == nullptr) return;
     lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, s_fft_db_min, s_fft_db_max);
-    fft_render();
+    fft_render(nullptr);
     lv_obj_invalidate(chart);
 }
 
@@ -573,10 +597,14 @@ static void fft_timer_cb(lv_timer_t *timer) {
     xSemaphoreGive(fft_mux);
     if (!fresh) return;
 
-    fft_render();
-    lv_area_t area;
-    fft_plot_area(chart, &area);
-    lv_obj_invalidate_area(chart, &area);
+    // redraw only the rectangle the bars changed in, not the whole plot
+    lv_area_t dirty;
+    if (fft_render(&dirty)) {
+        lv_area_t plot;
+        fft_plot_area(chart, &plot);
+        lv_area_move(&dirty, plot.x1, plot.y1);                            // image -> screen coordinates
+        lv_obj_invalidate_area(chart, &dirty);
+    }
 
     // peak list: slower than the bars, so the values stay readable
     if (s_fft_peaks_on && s_fft_peak_rows > 0 && lv_tick_elaps(s_fft_peaks_tick) >= FFT_PEAKS_UPDATE_PERIOD_MS) {

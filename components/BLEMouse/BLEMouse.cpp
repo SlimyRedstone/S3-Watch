@@ -221,10 +221,22 @@ static void start_advertising(void)
     ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event, NULL);
 }
 
+// Internal RAM free just before the stack was started, to log its real cost
+// once the host is up (BLE_MIN_INTERNAL_FREE is an estimate until measured).
+static size_t s_ble_free_before = 0;
+
 static void on_sync(void)
 {
     ble_hs_id_infer_auto(0, &s_addr_type);
     start_advertising();
+    if (s_ble_free_before != 0) {
+        const size_t now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        ESP_UTILS_LOGI("BLE up: internal RAM %u -> %u free, stack took %u B (min block now %u)",
+                       (unsigned)s_ble_free_before, (unsigned)now,
+                       (unsigned)(s_ble_free_before > now ? s_ble_free_before - now : 0),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        s_ble_free_before = 0;
+    }
 }
 
 static void on_reset(int reason) { (void)reason; }
@@ -284,6 +296,7 @@ static bool ble_set_enabled(bool enable)
                            (unsigned)BLE_MIN_INTERNAL_FREE, (unsigned)BLE_MIN_INTERNAL_BLOCK);
             return false;
         }
+        s_ble_free_before = free_b;
         if (ble_mouse_init("S3 Watch") != ESP_OK) {
             ESP_UTILS_LOGE("Bluetooth init failed");
             return false;
@@ -710,13 +723,10 @@ void BLEMouse::onPollTimer(lv_timer_t *t)
 
 void BLEMouse::refreshStatusIcon()
 {
-    auto *phone = getSystem();
-    if (!phone) return;
-    auto *bar = phone->getDisplay().getStatusBar();
-    if (!bar) return;
-    bar->setWifiIconState(s_connected
-        ? systems::phone::StatusBar::WifiState::SIGNAL_3
-        : systems::phone::StatusBar::WifiState::DISCONNECTED);
+    // The Wi-Fi icon used to mirror the BLE link here. The status bar now has
+    // its own Bluetooth icon (Settings), and the Wi-Fi icon follows the Wi-Fi /
+    // ESP-NOW switches. Caller holds the LVGL lock.
+    Settings::setBluetoothConnected(s_connected);
 }
 
 void BLEMouse::onConnectionChanged(bool /*connected*/)

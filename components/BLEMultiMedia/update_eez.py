@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Rewrite EEZ Studio output in ./ui/ to prefix every top-level symbol with
-'RemoteNow_' so multiple apps can coexist without multiple-definition link
+'BLEMultiMedia_' so multiple apps can coexist without multiple-definition link
 errors.
 
 Run from this app's folder:
@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_NAME = "RemoteNow"
+APP_NAME = "BLEMultiMedia"
 UI_DIR   = Path(__file__).resolve().parent / "ui"
 
 # Names starting with any of these are left alone (LVGL, ESP, libc, etc.).

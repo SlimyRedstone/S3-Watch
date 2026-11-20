@@ -19,6 +19,7 @@
 #include "Settings.hpp"   // persisted speaker volume
 #include "esp_dsp.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"   // EXT_RAM_BSS_ATTR: static buffers in PSRAM (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY)
 #include "esp_timer.h"
 #include "esp_vfs.h"
 #include "esp_vfs_common.h"
@@ -57,8 +58,9 @@ namespace {
 	static char s_selected_path[160] = "";
 	static bool s_audio_inited			 = false;
 
-	__attribute__((aligned(16))) static float s_fft_wind[FFT_N];
-	__attribute__((aligned(16))) static float s_fft_buf[FFT_N * 2];
+	// PSRAM: 12 KB that used to sit in internal SRAM for the whole uptime, even with the app closed
+	EXT_RAM_BSS_ATTR __attribute__((aligned(16))) static float s_fft_wind[FFT_N];
+	EXT_RAM_BSS_ATTR __attribute__((aligned(16))) static float s_fft_buf[FFT_N * 2];
 	static float s_bar_db[BARS];
 	static float s_bar_peak[BARS];
 
@@ -267,7 +269,7 @@ namespace {
 
 		// Collect filenames first so we can sort.
 		static constexpr int MAX_FILES = 128;
-		static char names[MAX_FILES][96];
+		EXT_RAM_BSS_ATTR static char names[MAX_FILES][96];      // 12 KB, PSRAM
 		int n = 0;
 
 		DIR *d = opendir(REC_DIR);

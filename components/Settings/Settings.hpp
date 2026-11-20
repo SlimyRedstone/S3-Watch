@@ -21,7 +21,9 @@
  *       "bluetooth": { "enabled" },
  *       "wifi":      { "enabled" },
  *       "espnow":    { "enabled" },
- *       "upgrade":   { "enabled" } } }
+ *       "battery":   { "show_percentage" },
+ *       "upgrade":   { "enabled", "src_url" },
+ *       "developer": { "performance_counter" } } }
  */
 #pragma once
 
@@ -31,12 +33,15 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 
+// Firmware update source, used when settings.upgrade.src_url is missing.
+#define SETTINGS_DEFAULT_UPDATE_URL "https://api.slimyredstone.net/code/s3-watch/version"
+
 namespace esp_brookesia::apps {
 
 class Settings : public systems::phone::App {
 public:
     static constexpr uint8_t  PMU_I2C_ADDR     = 0x34;
-    static constexpr uint32_t STATUS_PERIOD_MS = 5 * 1000; // status bar update
+    static constexpr uint32_t STATUS_PERIOD_MS = 1500; // status bar update
     static constexpr uint32_t SAVE_DEBOUNCE_MS = 1000;     // slider drag -> one SD write
 
     // Vibration motor: GPIO18, active high, through a transistor (schematic
@@ -64,7 +69,12 @@ public:
         struct Bluetooth { bool enabled = false; } bluetooth;
         struct Wifi      { bool enabled = false; } wifi;
         struct Espnow    { bool enabled = false; } espnow;
-        struct Upgrade   { bool enabled = false; } upgrade;   // "Check for updates" switch, UI only
+        struct Battery   { bool show_percentage = false; } battery;     // "Display percentage" switch
+        struct Upgrade {
+            bool enabled = false;                                       // UI only, no switch in the menu yet
+            char src_url[192] = SETTINGS_DEFAULT_UPDATE_URL;            // version document, see fetchLatestVersion()
+        } upgrade;
+        struct Developer { bool performance_counter = false; } developer;
     };
     static AppConfig cfg;                              // live values
     static constexpr const char *CFG_PATH = "/sdcard/.settings.json";
@@ -105,6 +115,54 @@ public:
     static bool applyBluetooth();                      // handler(cfg.bluetooth.enabled)
     static volatile bool bluetooth_running;            // set by the BLE app while the stack is up
 
+    // LVGL performance monitor (FPS / CPU / render+flush time, bottom right)
+    // shown or hidden per cfg.developer.performance_counter. LVGL creates it
+    // at display creation (CONFIG_LV_USE_PERF_MONITOR); hidden, its refresh
+    // timer is paused too. Needs the LVGL lock (LVGL task or LvLockGuard).
+    static void applyPerformanceCounter();
+
+    // ---- Status bar (top-right icon area + clock) ----
+    // Wi-Fi icon only while Wi-Fi or ESP-NOW is enabled: connected -> 3 bars,
+    // else the "Wi-Fi off" glyph. Called on the switches and by the status timer.
+    static void refreshWifiIcon();
+    // Battery percentage text next to the battery icon (cfg.battery.show_percentage).
+    static void applyBatteryPercentage();
+    // Moves the clock left once more than STATUS_ICONS_BEFORE_SHIFT icons are
+    // shown (by the width of the extra ones), and whenever the icons would
+    // reach it. Runs on every layout change of the icon or clock area.
+    static void layoutStatusBar();
+    static constexpr int     STATUS_ICONS_BEFORE_SHIFT = 3;
+    static constexpr uint8_t STATUS_CLOCK_AREA         = 1;   // main/dark/status_bar_data.hpp
+    static constexpr uint8_t STATUS_ICON_AREA          = 2;
+
+    // ---- Firmware version / update (SettingsUpgrade.cpp) ----
+    struct FirmwareVersion {
+        uint16_t major_num;
+        uint16_t minor_num;
+        uint16_t patch_num;
+    };
+    static constexpr FirmwareVersion FW_VERSION = {0, 5, 0};    // installed firmware: bump on every release
+    static FirmwareVersion getVersion() { return FW_VERSION; }
+    static const char *getVersionText();                        // "v0.5.0"
+
+    // Latest release, as published at cfg.upgrade.src_url:
+    //   {"last":{"t":"v1.2.0","n":[1,2,0]}, "url":"https://.../v1.2.0.bin"}
+    struct UpdateInfo {
+        FirmwareVersion version;                                // from "n" (or parsed from "t")
+        char tag[32];                                           // "t", e.g. "v1.2.0"
+        char url[256];                                          // firmware image
+    };
+    // Blocking HTTP(S) GET + parse. Do not call from the LVGL task. On failure
+    // returns false with a user-readable reason in err.
+    static bool fetchLatestVersion(UpdateInfo &out, char *err, size_t err_len);
+    // "Check for updates" button: Wi-Fi check, then version check and download
+    // to the SD card (/sdcard/.temp/) on a worker thread, with message boxes.
+    static void checkForUpdates();
+    // Station connected with an IP. False while Wi-Fi was never started.
+    static bool isWifiConnected();
+    // SD card mounted at boot (settings file, firmware downloads).
+    static bool isSdMounted();
+
     // VBUS present (USB plugged). False if the PMU is not reachable.
     static bool isCharging();
 
@@ -139,6 +197,8 @@ private:
     static void onStatusTimer(lv_timer_t *t);
     static void onSaveTimer(lv_timer_t *t);
     static void onIndevPressed(lv_event_t *e);
+    static void onStatusBarLayout(lv_event_t *e);
+    static systems::phone::StatusBar *statusBar();
     static void syncSlidersFromCfg(lv_obj_t *root);
 
     static Settings *_instance;

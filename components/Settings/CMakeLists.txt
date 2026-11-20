@@ -13,6 +13,7 @@ idf_component_register(
         ${CMAKE_CURRENT_LIST_DIR}/ui
         ${CMAKE_CURRENT_LIST_DIR}/icon
     REQUIRES driver esp_hw_support esp_timer XPowersLib json fatfs bsp_extra
+             esp_http_client esp-tls mbedtls esp_netif pthread   # firmware update check (SettingsUpgrade.cpp)
     WHOLE_ARCHIVE   # Keep static plugin registrar linked.
 )
 

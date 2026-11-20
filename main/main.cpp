@@ -87,7 +87,7 @@ extern "C" void app_main(void) {
 
 	bsp_display_cfg_t cfg = {
 		.lvgl_port_cfg = {                                 
-			.task_priority		= 1,         
+			.task_priority		= 2,         
 			.task_stack			= 16 * 1024, 
 			.task_affinity		= 1,        
 			.task_max_sleep_ms 	= 5,       
@@ -239,6 +239,7 @@ extern "C" void app_main(void) {
 						.name				= "mem_info",
 						.core_id		= 1,       // UI-side helper: it only touches LVGL
 						.stack_size = 4096,
+						.stack_in_ext = true,  // PSRAM: no flash access, no sleep from this thread
 				});
 		boost::thread([=]() {
 			char buffer[128]; /* Make sure buffer is enough for `sprintf` */
