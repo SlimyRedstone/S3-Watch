@@ -16,7 +16,7 @@
     cont = create_text(section, icon, title, LV_MENU_ITEM_BUILDER_VARIANT_1);\
     lv_menu_set_load_page_event(menu, cont, submenu);\
 }
-#define USE_ICONS_SUBMENU_LABELS
+// #define USE_ICONS_SUBMENU_LABELS
 
 objects_t Settings_objects;
 lv_obj_t *Settings_tick_value_change_obj;
