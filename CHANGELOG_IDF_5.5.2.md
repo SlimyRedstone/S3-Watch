@@ -506,6 +506,27 @@ Log: `Init static rx buffer size: 2212`, `malloc buffer fail`, `Expected to init
 - Sleep life shows "> 12d04h" (lower bound) when fewer than 2 % were lost after 6 h of sleep.
 - `pmu_open()`: VBUS voltage ADC channel enabled.
 
+### Settings > Apps: apps loaded on boot (`SettingsApps.cpp`, new)
+- `settings.apps.unloaded[]`: names of registered apps not loaded at boot (`cfg.apps`, up to 16 x 31 bytes). Missing =
+  all loaded. Unknown names are kept (logged), non-strings ignored.
+- `main.cpp`: `initAppFromRegistry()` replaced by a loop over `App::Registry::listRegisteredNames()` (creates no app):
+  apps with `Settings::isAppLoadedOnBoot()` false are neither created nor installed (no icon, no `init()`).
+  `Settings::ensureLoaded()` runs first. Changes apply at the next boot.
+- App tags, set by the app in its .cpp with `SETTINGS_APP_TAGS(APP_NAME, tags)` (static init, known for apps never
+  created; table in `SettingsApps.cpp`, `Settings::tagApp()` / `appTags()`):
+  - `APP_TAG_HIDDEN`: not in `get_applications()`, so not on the Apps page;
+  - `APP_TAG_ALWAYS_LOADED`: `set_application(name, false)` refused, `settings.apps.unloaded` entry ignored, row
+    disabled if listed;
+  - `APP_TAG_SYSTEM` = both. Set on Clock (sleep, wake-up, auto-start) and Settings (this list, PMU, Wi-Fi).
+    Replaces the hard-coded always-loaded names.
+- C bridge (`settings_ui_bridge.h`): `get_applications()` (every registered app, NULL-terminated, built once),
+  `set_application(name, load)`, `get_application_status(name)`, `action_application_clicked(item)`.
+- `ui/screens.c` `create_list(parent, get_items, on_click)`: `lv_list` (not scrollable, the page scrolls), one list
+  button per item with a checkbox left of the label. A click on the item toggles the checkbox, then `on_click(item)`.
+  Checkboxes start unchecked: `Settings::syncAppList()` sets them from cfg in `run()`.
+- Side effects: BLE Mouse unloaded = no Bluetooth handler (the switch stays off). Podometer unloaded: its background
+  service is still started by `main.cpp` (steps still counted).
+
 ## 5. What to do now
 
 1. `idf.py build` (full build, link untested by me).

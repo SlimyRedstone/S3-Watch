@@ -1512,4 +1512,7 @@ ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, ClockApp, APP_NAM
     return std::shared_ptr<ClockApp>(ClockApp::requestInstance(), [](ClockApp *p) {});
 })
 
+// Sleep, wake-up and auto-start live here: not in Settings > Apps, never unloaded.
+SETTINGS_APP_TAGS(APP_NAME, Settings::APP_TAG_SYSTEM);
+
 } // namespace esp_brookesia::apps

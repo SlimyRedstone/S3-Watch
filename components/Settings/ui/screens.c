@@ -135,6 +135,43 @@ static lv_obj_t *create_button( lv_obj_t *parent, const char *txt, lv_event_cb_t
 	return obj;
 }
 
+// create_list() inputs: the items (NULL-terminated array of texts), and the
+// handler of a click on one item (the list button, see below).
+typedef const char **(*list_items_cb_t)(void);
+typedef void (*list_click_cb_t)(lv_obj_t *item);
+
+static void Settings_list_item_clicked(lv_event_t *e) {
+	lv_obj_t *item = lv_event_get_current_target_obj(e);
+	list_click_cb_t on_click = (list_click_cb_t)(uintptr_t)lv_event_get_user_data(e);
+	lv_obj_t *box = lv_obj_get_child_by_type(item, 0, &lv_checkbox_class);
+	if (box != NULL) {
+		if (lv_obj_has_state(box, LV_STATE_CHECKED)) lv_obj_remove_state(box, LV_STATE_CHECKED);
+		else                                         lv_obj_add_state(box, LV_STATE_CHECKED);
+	}
+	if (on_click != NULL) on_click(item);
+}
+
+// List appended to parent: one item per text from get_items(), a checkbox on
+// the left of the text. Item = list button { checkbox, label }. A click
+// anywhere on the item toggles its checkbox, then calls on_click(item).
+// Checkboxes start unchecked: the caller sets them (Settings::syncAppList()).
+static lv_obj_t *create_list( lv_obj_t *parent, list_items_cb_t get_items, list_click_cb_t on_click) {
+	lv_obj_t *list = lv_list_create(parent);
+	lv_obj_set_size(list, LV_PCT(100), LV_SIZE_CONTENT);
+	lv_obj_remove_flag(list, LV_OBJ_FLAG_SCROLLABLE);          // the menu page scrolls
+
+	const char **items = (get_items != NULL) ? get_items() : NULL;
+	for (size_t i = 0; items != NULL && items[i] != NULL; i++) {
+		lv_obj_t *item = lv_list_add_button(list, NULL, items[i]);
+		lv_obj_t *box = lv_checkbox_create(item);
+		lv_checkbox_set_text(box, "");
+		lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);        // the item takes the click
+		lv_obj_move_to_index(box, 0);                          // left of the text
+		lv_obj_add_event_cb(item, Settings_list_item_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)on_click);
+	}
+	return list;
+}
+
 
 
 
@@ -174,6 +211,7 @@ void Settings_create_screen_main() {
             lv_obj_t *sub_sdcard_page = lv_menu_page_create(menu, NULL);
             lv_obj_t *sub_about_page = lv_menu_page_create(menu, NULL);
             lv_obj_t *sub_dev_page = lv_menu_page_create(menu, NULL);
+            lv_obj_t *sub_apps_page = lv_menu_page_create(menu, NULL);
 
 
             //  Root Settings page
@@ -184,6 +222,7 @@ void Settings_create_screen_main() {
                 #ifdef USE_ICONS_SUBMENU_LABELS
                     ADD_SUBMENU("Display", sub_display_page, (const char*)LV_SYMBOL_SETTINGS)
                     ADD_SUBMENU("Audio", sub_audio_page, (const char*)LV_SYMBOL_VOLUME_MAX)
+                    ADD_SUBMENU("Apps", sub_apps_page, (const char*)LV_SYMBOL_LIST)
                     ADD_SUBMENU("WiFi", sub_wifi_page, (const char*)LV_SYMBOL_WIFI)
                     ADD_SUBMENU("Bluetooth", sub_bluetooth_page,(const char*)LV_SYMBOL_BLUETOOTH)
                     ADD_SUBMENU("ESP-Now", sub_espnow_page, (const char*)LV_SYMBOL_SETTINGS)
@@ -195,6 +234,7 @@ void Settings_create_screen_main() {
                 #else
                     ADD_SUBMENU("Display", sub_display_page, NULL)
                     ADD_SUBMENU("Audio", sub_audio_page, NULL)
+                    ADD_SUBMENU("Apps", sub_apps_page, NULL)
                     ADD_SUBMENU("WiFi", sub_wifi_page, NULL)
                     ADD_SUBMENU("Bluetooth", sub_bluetooth_page, NULL)
                     ADD_SUBMENU("ESP-Now", sub_espnow_page, NULL)
@@ -304,6 +344,15 @@ void Settings_create_screen_main() {
                 SET_SUBMENU_SEPARATOR( sub_sdcard_page )
                 section = lv_menu_section_create( sub_sdcard_page );
                 create_text(section, LV_SYMBOL_SD_CARD, "SD Card", LV_MENU_ITEM_BUILDER_VARIANT_1);
+            }
+
+            //  Apps Sub-Menu
+            {   
+                SET_SUBMENU_PADDING( sub_apps_page )
+                SET_SUBMENU_SEPARATOR( sub_apps_page )
+                section = lv_menu_section_create( sub_apps_page );
+                create_text(section, LV_SYMBOL_LIST, "Applications", LV_MENU_ITEM_BUILDER_VARIANT_1);
+                create_list(section, get_applications, action_application_clicked);
             }
 
             //  About Sub-Menu

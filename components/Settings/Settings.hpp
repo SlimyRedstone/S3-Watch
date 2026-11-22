@@ -30,7 +30,8 @@
  *       "espnow":    { "enabled" },
  *       "battery":   { "show_percentage" },
  *       "upgrade":   { "enabled", "src_url" },
- *       "developer": { "performance_counter" } } }
+ *       "developer": { "performance_counter" },
+ *       "apps":      { "unloaded": ["Sonometer", "RemoteNow"] } } }
  */
 #pragma once
 
@@ -56,6 +57,10 @@ public:
     // "Motor" block; same pin the Waveshare factory firmware uses).
     static constexpr gpio_num_t MOTOR_GPIO       = GPIO_NUM_18;
     static constexpr uint32_t   MOTOR_MAX_ON_MS  = 1000;   // hard cap, whatever the config says
+
+    // settings.apps.unloaded (see "Apps loaded on boot" below)
+    static constexpr int APPS_MAX     = 16;                // entries
+    static constexpr int APP_NAME_MAX = 32;                // bytes per name, with the terminator
 
     // ---- Persistent app config (read by other apps; saved to SD) ----
     // Defaults equal the initial values of the generated UI widgets.
@@ -93,6 +98,12 @@ public:
             char src_url[192] = SETTINGS_DEFAULT_UPDATE_URL;            // version document, see fetchLatestVersion()
         } upgrade;
         struct Developer { bool performance_counter = false; } developer;
+        struct Apps {
+            // Registered apps main.cpp does not create at boot (Settings > Apps).
+            // Names not registered (app removed from the firmware) are kept.
+            char    unloaded[APPS_MAX][APP_NAME_MAX] = {};
+            uint8_t unloaded_count = 0;
+        } apps;
     };
     static AppConfig cfg;                              // live values
     static constexpr const char *CFG_PATH     = "/sdcard/.settings.json";
@@ -262,6 +273,25 @@ public:
     static void batterySleepEnd();
     static void batteryCommit();
 
+    // ---- Apps loaded on boot (SettingsApps.cpp) ----
+    // main.cpp creates and installs only the registered apps for which
+    // isAppLoadedOnBoot() is true (call ensureLoaded() first). An app left out
+    // has no icon and its init() never runs. Changes apply at the next boot.
+    //
+    // App tags: set by the app itself with SETTINGS_APP_TAGS() (below), at
+    // static init, so they are known for apps never created.
+    enum AppTag : uint32_t {
+        APP_TAG_HIDDEN        = 1u << 0,               // not listed in Settings > Apps (get_applications())
+        APP_TAG_ALWAYS_LOADED = 1u << 1,               // never unloaded: settings.apps.unloaded entry ignored
+        APP_TAG_SYSTEM        = APP_TAG_HIDDEN | APP_TAG_ALWAYS_LOADED,   // Clock, Settings
+    };
+    static void     tagApp(const char *name, uint32_t tags);   // adds to the app's tags (SETTINGS_APP_TAGS())
+    static uint32_t appTags(const char *name);                 // 0: none
+    static bool isAppAlwaysLoaded(const char *name);   // APP_TAG_ALWAYS_LOADED
+    static bool isAppLoadedOnBoot(const char *name);   // not in cfg.apps.unloaded, or always loaded
+    // cfg only (the caller saves). False: refused (always-loaded app, list full, name too long).
+    static bool setAppLoadedOnBoot(const char *name, bool load);
+
     // Wake-lock. Any app may set this true to prevent the watch from
     // entering light/deep sleep while it is in use (e.g. flashlight).
     // Polled by ClockApp's sleep monitor.
@@ -295,6 +325,10 @@ private:
     // settings.wifi.ssid / pass <-> the network list (SettingsWifi.cpp).
     static void wifiListFromJson(cJSON *wifi);
     static void wifiListToJson(cJSON *wifi);
+    // settings.apps.unloaded <-> cfg.apps (SettingsApps.cpp). nullptr: none unloaded.
+    static void appsFromJson(cJSON *apps);
+    static void appsToJson(cJSON *apps);
+    static void syncAppList(lv_obj_t *root);           // run(): app list checkboxes <- cfg, always-loaded rows disabled
     static void onStatusTimer(lv_timer_t *t);
     static void refreshIpLabel();                      // WiFi > IP address row, while the menu is open
     static void batteryInit();                         // statistics <- NVS (init, after ensureLoaded())
@@ -321,3 +355,12 @@ private:
 };
 
 } // namespace esp_brookesia::apps
+
+// Tags an app by its registry name (the name given to
+// ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR), at static init. In the app's .cpp:
+//     SETTINGS_APP_TAGS(APP_NAME, Settings::APP_TAG_SYSTEM);
+#define SETTINGS_APP_TAGS_CAT2(a, b) a##b
+#define SETTINGS_APP_TAGS_CAT(a, b)  SETTINGS_APP_TAGS_CAT2(a, b)
+#define SETTINGS_APP_TAGS(name, tags)                                                  \
+    [[maybe_unused]] static const bool SETTINGS_APP_TAGS_CAT(s_settings_app_tags_, __LINE__) = \
+        (::esp_brookesia::apps::Settings::tagApp((name), (tags)), true)

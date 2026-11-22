@@ -14,6 +14,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include "lvgl.h"                                    // lv_obj_t (action_application_clicked)
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +43,12 @@ const char *get_battery_voltage_label(void);              // "Voltage: 4123mV"
 const char *get_battery_ac_voltage_label(void);           // "USB voltage: 5120mV"
 const char *get_battery_estimated_life_label(void);       // "Est. life: 1h35"
 const char *get_battery_estimated_sleep_life_label(void); // "Est. life, while sleeping: 5h45"
+
+// Apps page (SettingsApps.cpp). Loaded on boot = not in settings.apps.unloaded.
+const char **get_applications(void);                      // every registered app, loaded or not; NULL-terminated
+void set_application(const char *name, bool load_on_boot);
+bool get_application_status(const char *name);            // true: loaded on boot
+void action_application_clicked(lv_obj_t *item);          // create_list() row click -> set_application()
 
 #ifdef __cplusplus
 }

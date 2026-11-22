@@ -570,6 +570,8 @@ bool Settings::loadFromText(const char *text)
         cJSON *dev = cJSON_GetObjectItem(root, "developer");
         if (cJSON_IsObject(dev))  cfg.developer.performance_counter =
                                       json_bool(dev, "performance_counter", d.developer.performance_counter);
+        cJSON *apps = cJSON_GetObjectItem(root, "apps");
+        appsFromJson(cJSON_IsObject(apps) ? apps : nullptr);
     }
     cJSON_Delete(j);
     ESP_UTILS_LOGI("Settings loaded: brightness=%d dim=%d btn_wake=%d no_sleep_chg=%d ls_bri=%d ls=%ds ds=%ds "
@@ -618,6 +620,7 @@ char *Settings::buildJson()
     cJSON_AddStringToObject(up, "src_url", cfg.upgrade.src_url);
     cJSON_AddBoolToObject(cJSON_AddObjectToObject(root, "developer"), "performance_counter",
                           cfg.developer.performance_counter);
+    appsToJson(cJSON_AddObjectToObject(root, "apps"));
 
     char *out = cJSON_Print(j);  // pretty-printed
     cJSON_Delete(j);
@@ -1062,6 +1065,7 @@ bool Settings::run()
     s_ip_label = find_label_with_prefix(Settings_objects.main, IP_LABEL_PREFIX);
     if (s_ip_label != nullptr) lv_obj_add_event_cb(s_ip_label, ip_label_deleted_cb, LV_EVENT_DELETE, nullptr);
     batteryBindLabels(Settings_objects.main);
+    syncAppList(Settings_objects.main);
     return true;
 }
 
@@ -1338,5 +1342,8 @@ ESP_UTILS_REGISTER_PLUGIN_WITH_CONSTRUCTOR(systems::base::App, Settings, APP_NAM
 {
     return std::shared_ptr<Settings>(Settings::requestInstance(), [](Settings *p) {});
 })
+
+// Holds the app list itself (and the PMU, Wi-Fi, ...): not in Settings > Apps, never unloaded.
+SETTINGS_APP_TAGS(APP_NAME, Settings::APP_TAG_SYSTEM);
 
 } // namespace esp_brookesia::apps

@@ -10,6 +10,7 @@
 #include "esp_brookesia.hpp"
 #include "ClockApp.hpp"
 #include "Podometer.hpp"
+#include "Settings.hpp"
 #ifdef ESP_UTILS_LOG_TAG
 	#undef ESP_UTILS_LOG_TAG
 #endif
@@ -177,8 +178,23 @@ extern "C" void app_main(void) {
 		
 		ESP_LOGI("TIMING","t_phone=%lld us", esp_timer_get_time());
 
+		// Was phone->initAppFromRegistry(), which creates every registered app.
+		// Settings > Apps: an app in settings.apps.unloaded is neither created
+		// nor installed (no icon, no init()). Clock and Settings always are.
+		esp_brookesia::apps::Settings::ensureLoaded();
 		std::vector<systems::base::Manager::RegistryAppInfo> inited_apps;
-		ESP_UTILS_CHECK_FALSE_EXIT( phone->initAppFromRegistry(inited_apps), "Init app registry failed");
+		for (const auto &name : systems::base::App::Registry::listRegisteredNames()) {
+			if (!esp_brookesia::apps::Settings::isAppLoadedOnBoot(name.c_str())) {
+				ESP_UTILS_LOGI("App '%s' not loaded (Settings > Apps)", name.c_str());
+				continue;
+			}
+			auto app = systems::base::App::Registry::get(name);
+			if (app == nullptr) {
+				ESP_UTILS_LOGE("App '%s': get instance failed", name.c_str());
+				continue;
+			}
+			inited_apps.emplace_back(name, app);
+		}
 		ESP_UTILS_CHECK_FALSE_EXIT( phone->installAppFromRegistry(inited_apps), "Install app registry failed");
 		ESP_LOGI("TIMING","t_apps=%lld us", esp_timer_get_time());
 
